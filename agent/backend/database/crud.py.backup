@@ -1,0 +1,892 @@
+from sqlalchemy.orm import Session
+from sqlalchemy import desc, and_
+from sqlalchemy.exc import OperationalError
+from datetime import datetime, timedelta
+import uuid
+import time
+from typing import List, Optional, Dict, Any
+
+from .model import Session as ChatSession, Message, ReviewData, ReviewGenerationTask
+
+# Session CRUD operations
+
+def create_session(db: Session, session_id: Optional[str] = None) -> ChatSession:
+    """Create a new chat session"""
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"create_session called: session_id={session_id}")
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+        logger.info(f"Generated new session_id: {session_id}")
+
+    db_session = ChatSession(id=session_id, created_at=datetime.utcnow())
+    logger.info(f"Created ChatSession object")
+
+    # Retry logic for SQLite locking issues
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            db.add(db_session)
+            db.commit()
+            db.refresh(db_session)
+            return db_session
+        except OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 0.1  # Exponential backoff
+                time.sleep(wait_time)
+                # Rollback and retry
+                db.rollback()
+                continue
+            else:
+                raise
+        except Exception:
+            db.rollback()
+            raise
+
+def get_session(db: Session, session_id: str) -> Optional[ChatSession]:
+    """Get a session by ID"""
+    return db.query(ChatSession).filter(ChatSession.id == session_id).first()
+
+def get_all_sessions(db: Session, limit: int = 100) -> List[ChatSession]:
+    """Get all sessions, ordered by creation time"""
+    return db.query(ChatSession).order_by(desc(ChatSession.created_at)).limit(limit).all()
+
+def delete_session(db: Session, session_id: str) -> bool:
+    """Delete a session and all its messages"""
+    session = get_session(db, session_id)
+    if session:
+        # Retry logic for SQLite locking issues
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                # Delete associated messages first (cascade would handle this if configured)
+                db.query(Message).filter(Message.session_id == session_id).delete()
+                db.delete(session)
+                db.commit()
+                return True
+            except OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 0.1  # Exponential backoff
+                    time.sleep(wait_time)
+                    # Rollback and retry
+                    db.rollback()
+                    continue
+                else:
+                    raise
+            except Exception:
+                db.rollback()
+                raise
+    return False
+
+# Message CRUD operations
+
+def create_message(
+    db: Session,
+    session_id: str,
+    role: str,
+    content: str
+) -> Message:
+    """Create a new message in a session"""
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"create_message called: session_id={session_id}, role={role}, content_length={len(content)}")
+    # Ensure session exists
+    session = get_session(db, session_id)
+    if not session:
+        logger.info(f"Session {session_id} does not exist, creating new session")
+        session = create_session(db, session_id)
+
+    message = Message(
+        session_id=session_id,
+        role=role,
+        content=content,
+        timestamp=datetime.utcnow()
+    )
+
+    # Retry logic for SQLite locking issues
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            db.add(message)
+            db.commit()
+            db.refresh(message)
+            return message
+        except OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 0.1  # Exponential backoff
+                time.sleep(wait_time)
+                # Rollback and retry
+                db.rollback()
+                continue
+            else:
+                raise
+        except Exception:
+            db.rollback()
+            raise
+
+def get_messages_by_session(
+    db: Session,
+    session_id: str,
+    limit: int = 100
+) -> List[Message]:
+    """Get all messages for a session, ordered by timestamp"""
+    return (
+        db.query(Message)
+        .filter(Message.session_id == session_id)
+        .order_by(Message.timestamp)
+        .limit(limit)
+        .all()
+    )
+
+def get_message_count(db: Session, session_id: str) -> int:
+    """Get the number of messages in a session"""
+    return db.query(Message).filter(Message.session_id == session_id).count()
+
+def get_last_message(db: Session, session_id: str) -> Optional[Message]:
+    """Get the most recent message in a session"""
+    return (
+        db.query(Message)
+        .filter(Message.session_id == session_id)
+        .order_by(desc(Message.timestamp))
+        .first()
+    )
+
+def get_latest_conversation_rounds(db: Session, session_id: str, rounds: int = 1) -> List[Message]:
+    """Get the latest N rounds of conversation (each round: user + assistant messages)
+    Returns messages in chronological order (oldest first) for proper conversation flow.
+    """
+    # Each round consists of 2 messages (user + assistant)
+    limit = rounds * 2
+    messages = (
+        db.query(Message)
+        .filter(Message.session_id == session_id)
+        .order_by(desc(Message.timestamp))
+        .limit(limit)
+        .all()
+    )
+    # Reverse to get chronological order (oldest first)
+    messages.reverse()
+    return messages
+
+def delete_message(db: Session, message_id: int) -> bool:
+    """Delete a message by ID"""
+    message = db.query(Message).filter(Message.id == message_id).first()
+    if message:
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                db.delete(message)
+                db.commit()
+                return True
+            except OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 0.1  # Exponential backoff
+                    time.sleep(wait_time)
+                    # Rollback and retry
+                    db.rollback()
+                    continue
+                else:
+                    raise
+            except Exception:
+                db.rollback()
+                raise
+    return False
+
+def clear_session_messages(db: Session, session_id: str) -> int:
+    """Delete all messages in a session, return count deleted"""
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            count = db.query(Message).filter(Message.session_id == session_id).delete()
+            db.commit()
+            return count
+        except OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 0.1  # Exponential backoff
+                time.sleep(wait_time)
+                # Rollback and retry
+                db.rollback()
+                continue
+            else:
+                raise
+        except Exception:
+            db.rollback()
+            raise
+
+def update_message_content(db: Session, message_id: int, new_content: str) -> Optional[Message]:
+    """Update the content of an existing message"""
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            message = db.query(Message).filter(Message.id == message_id).first()
+            if message:
+                message.content = new_content
+                db.commit()
+                db.refresh(message)
+                return message
+            return None
+        except OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 0.1  # Exponential backoff
+                time.sleep(wait_time)
+                db.rollback()
+                continue
+            else:
+                raise
+        except Exception:
+            db.rollback()
+            raise
+
+
+def get_recent_messages_all_sessions(db: Session, days: int = 3, limit: int = 100) -> List[Message]:
+    """Get recent messages from all sessions within the last N days"""
+    cutoff_time = datetime.utcnow() - timedelta(days=days)
+    return (
+        db.query(Message)
+        .filter(Message.timestamp >= cutoff_time)
+        .order_by(desc(Message.timestamp))
+        .limit(limit)
+        .all()
+    )
+
+
+def get_recent_messages_by_session(db: Session, session_id: str, days: int = 3, limit: int = 100) -> List[Message]:
+    """Get recent messages from a specific session within the last N days"""
+    cutoff_time = datetime.utcnow() - timedelta(days=days)
+    return (
+        db.query(Message)
+        .filter(Message.session_id == session_id, Message.timestamp >= cutoff_time)
+        .order_by(Message.timestamp)
+        .limit(limit)
+        .all()
+    )
+
+
+def get_recent_sessions(db: Session, days: int = 3, limit: int = 50) -> List[ChatSession]:
+    """Get sessions that have had activity (messages) within the last N days"""
+    cutoff_time = datetime.utcnow() - timedelta(days=days)
+
+    # Find sessions with recent messages
+    recent_message_query = (
+        db.query(Message.session_id)
+        .filter(Message.timestamp >= cutoff_time)
+        .distinct()
+        .subquery()
+    )
+
+    return (
+        db.query(ChatSession)
+        .join(recent_message_query, ChatSession.id == recent_message_query.c.session_id)
+        .order_by(desc(ChatSession.created_at))
+        .limit(limit)
+        .all()
+    )
+
+
+def get_session_ids_with_recent_activity(db: Session, days: int = 3) -> List[str]:
+    """Get list of session IDs that have had activity within the last N days"""
+    cutoff_time = datetime.utcnow() - timedelta(days=days)
+    result = (
+        db.query(Message.session_id)
+        .filter(Message.timestamp >= cutoff_time)
+        .distinct()
+        .all()
+    )
+    return [row[0] for row in result]
+
+
+# ReviewData CRUD operations
+
+def create_or_update_review_data(
+    db: Session,
+    session_id: str,
+    review_groups: List[Dict[str, Any]],
+    aggregated_summary: str,
+    next_review_date: datetime,
+    generation_config: Dict[str, Any],
+    expires_at: Optional[datetime] = None,
+    generation_status: str = "completed"
+) -> ReviewData:
+    """Create or update structured review data for a session"""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # Check if review data already exists
+    existing = db.query(ReviewData).filter(ReviewData.session_id == session_id).first()
+    now = datetime.utcnow()
+
+    if expires_at is None:
+        expires_at = now + timedelta(hours=24)  # Default 24-hour expiration
+
+    # Calculate statistics
+    total_cards = 0
+    total_questions = 0
+    for group in review_groups:
+        total_cards += len(group.get("knowledge_cards", []))
+        total_questions += len(group.get("quiz_questions", []))
+
+    if existing:
+        # Update existing record with new structure
+        existing.review_groups = review_groups
+        existing.aggregated_summary = aggregated_summary
+        existing.next_review_date = next_review_date
+        existing.generation_config = generation_config
+        existing.generation_status = generation_status
+        existing.generated_at = now
+        existing.expires_at = expires_at
+        existing.error_message = None
+        existing.total_groups = len(review_groups)
+        existing.total_cards = total_cards
+        existing.total_questions = total_questions
+        logger.info(f"Updated review data for session {session_id}")
+    else:
+        # Create new record with new structure
+        existing = ReviewData(
+            session_id=session_id,
+            review_groups=review_groups,
+            aggregated_summary=aggregated_summary,
+            next_review_date=next_review_date,
+            generation_config=generation_config,
+            generation_status=generation_status,
+            generated_at=now,
+            expires_at=expires_at,
+            last_attempt_at=now,
+            learned_cards=[],
+            completed_quizzes=[],
+            review_count=0,
+            total_groups=len(review_groups),
+            total_cards=total_cards,
+            total_questions=total_questions
+        )
+        db.add(existing)
+        logger.info(f"Created structured review data for session {session_id}")
+
+    # Retry logic for SQLite locking issues
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            db.commit()
+            db.refresh(existing)
+            return existing
+        except OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 0.1
+                time.sleep(wait_time)
+                db.rollback()
+                continue
+            else:
+                raise
+        except Exception:
+            db.rollback()
+            raise
+
+def get_review_data(db: Session, session_id: str) -> Optional[ReviewData]:
+    """Get review data for a session"""
+    return db.query(ReviewData).filter(ReviewData.session_id == session_id).first()
+
+def get_valid_review_data(db: Session, session_id: str) -> Optional[ReviewData]:
+    """Get valid (non-expired and completed) review data for a session"""
+    now = datetime.utcnow()
+    review_data = db.query(ReviewData).filter(
+        ReviewData.session_id == session_id,
+        ReviewData.generation_status == "completed",
+        ReviewData.expires_at > now
+    ).first()
+    return review_data
+
+def update_review_generation_status(
+    db: Session,
+    session_id: str,
+    status: str,
+    error_message: Optional[str] = None
+) -> Optional[ReviewData]:
+    """Update generation status for review data"""
+    review_data = get_review_data(db, session_id)
+    if review_data:
+        review_data.generation_status = status
+        review_data.last_attempt_at = datetime.utcnow()
+        if error_message:
+            review_data.error_message = error_message
+        if status == "completed":
+            review_data.generated_at = datetime.utcnow()
+        elif status == "failed" and error_message:
+            review_data.error_message = error_message[:500]  # Limit error message length
+
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                db.commit()
+                db.refresh(review_data)
+                return review_data
+            except OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 0.1
+                    time.sleep(wait_time)
+                    db.rollback()
+                    continue
+                else:
+                    raise
+            except Exception:
+                db.rollback()
+                raise
+    return None
+
+def mark_review_question_completed(
+    db: Session,
+    session_id: str,
+    question_id: int
+) -> Optional[ReviewData]:
+    """Mark a review question as completed"""
+    review_data = get_review_data(db, session_id)
+    if review_data:
+        completed = review_data.questions_completed or []
+        if question_id not in completed:
+            completed.append(question_id)
+            review_data.questions_completed = completed
+            review_data.last_reviewed_at = datetime.utcnow()
+            review_data.review_count = (review_data.review_count or 0) + 1
+
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    db.commit()
+                    db.refresh(review_data)
+                    return review_data
+                except OperationalError as e:
+                    if "database is locked" in str(e) and attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 0.1
+                        time.sleep(wait_time)
+                        db.rollback()
+                        continue
+                    else:
+                        raise
+                except Exception:
+                    db.rollback()
+                    raise
+    return None
+
+def mark_review_recommendation_completed(
+    db: Session,
+    session_id: str,
+    recommendation_id: int
+) -> Optional[ReviewData]:
+    """Mark a review recommendation as completed"""
+    review_data = get_review_data(db, session_id)
+    if review_data:
+        completed = review_data.recommendations_completed or []
+        if recommendation_id not in completed:
+            completed.append(recommendation_id)
+            review_data.recommendations_completed = completed
+            review_data.last_reviewed_at = datetime.utcnow()
+            review_data.review_count = (review_data.review_count or 0) + 1
+
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    db.commit()
+                    db.refresh(review_data)
+                    return review_data
+                except OperationalError as e:
+                    if "database is locked" in str(e) and attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 0.1
+                        time.sleep(wait_time)
+                        db.rollback()
+                        continue
+                    else:
+                        raise
+                except Exception:
+                    db.rollback()
+                    raise
+    return None
+
+def get_expired_review_data(db: Session, limit: int = 50) -> List[ReviewData]:
+    """Get expired review data that needs regeneration"""
+    now = datetime.utcnow()
+    return (
+        db.query(ReviewData)
+        .filter(
+            ReviewData.expires_at <= now,
+            ReviewData.generation_status == "completed"
+        )
+        .order_by(ReviewData.expires_at)
+        .limit(limit)
+        .all()
+    )
+
+def get_failed_review_data(db: Session, limit: int = 20) -> List[ReviewData]:
+    """Get review data that failed generation"""
+    return (
+        db.query(ReviewData)
+        .filter(ReviewData.generation_status == "failed")
+        .order_by(ReviewData.last_attempt_at)
+        .limit(limit)
+        .all()
+    )
+
+def get_review_data_in_progress(db: Session, timeout_minutes: int = 30) -> List[ReviewData]:
+    """Get review data that's been in 'generating' status for too long"""
+    cutoff_time = datetime.utcnow() - timedelta(minutes=timeout_minutes)
+    return (
+        db.query(ReviewData)
+        .filter(
+            ReviewData.generation_status == "generating",
+            ReviewData.last_attempt_at <= cutoff_time
+        )
+        .order_by(ReviewData.last_attempt_at)
+        .limit(20)
+        .all()
+    )
+
+def delete_review_data(db: Session, session_id: str) -> bool:
+    """Delete review data for a session"""
+    review_data = get_review_data(db, session_id)
+    if review_data:
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                db.delete(review_data)
+                db.commit()
+                return True
+            except OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 0.1
+                    time.sleep(wait_time)
+                    db.rollback()
+                    continue
+                else:
+                    raise
+            except Exception:
+                db.rollback()
+                raise
+    return False
+
+def get_sessions_needing_review_generation(
+    db: Session,
+    session_ids: List[str],
+    exclude_statuses: List[str] = None
+) -> List[str]:
+    """Filter session IDs that need review generation"""
+    if exclude_statuses is None:
+        exclude_statuses = ["generating", "completed"]
+
+    now = datetime.utcnow()
+    # Get sessions with no review data or with expired/failed status
+    existing_reviews = (
+        db.query(ReviewData)
+        .filter(ReviewData.session_id.in_(session_ids))
+        .all()
+    )
+
+    existing_map = {rd.session_id: rd for rd in existing_reviews}
+    needs_generation = []
+
+    for session_id in session_ids:
+        if session_id not in existing_map:
+            needs_generation.append(session_id)
+        else:
+            review_data = existing_map[session_id]
+            if (review_data.generation_status in ["failed", "pending"] or
+                (review_data.generation_status == "completed" and review_data.expires_at <= now)):
+                needs_generation.append(session_id)
+
+    return needs_generation
+
+# ReviewGenerationTask CRUD operations
+
+def create_review_generation_task(
+    db: Session,
+    session_id: str,
+    task_type: str = "initial",
+    priority: int = 0,
+    review_data_id: Optional[int] = None
+) -> ReviewGenerationTask:
+    """Create a new review generation task"""
+    task = ReviewGenerationTask(
+        session_id=session_id,
+        task_type=task_type,
+        status="pending",
+        priority=priority,
+        created_at=datetime.utcnow(),
+        review_data_id=review_data_id
+    )
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            db.add(task)
+            db.commit()
+            db.refresh(task)
+            return task
+        except OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 0.1
+                time.sleep(wait_time)
+                db.rollback()
+                continue
+            else:
+                raise
+        except Exception:
+            db.rollback()
+            raise
+
+def get_pending_tasks(db: Session, limit: int = 20) -> List[ReviewGenerationTask]:
+    """Get pending review generation tasks"""
+    return (
+        db.query(ReviewGenerationTask)
+        .filter(ReviewGenerationTask.status == "pending")
+        .order_by(desc(ReviewGenerationTask.priority), ReviewGenerationTask.created_at)
+        .limit(limit)
+        .all()
+    )
+
+def update_task_status(
+    db: Session,
+    task_id: int,
+    status: str,
+    error_message: Optional[str] = None
+) -> Optional[ReviewGenerationTask]:
+    """Update task status"""
+    task = db.query(ReviewGenerationTask).filter(ReviewGenerationTask.id == task_id).first()
+    if task:
+        task.status = status
+        now = datetime.utcnow()
+        if status == "running":
+            task.started_at = now
+        elif status in ["completed", "failed"]:
+            task.completed_at = now
+            if error_message:
+                task.error_message = error_message
+
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                db.commit()
+                db.refresh(task)
+                return task
+            except OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 0.1
+                    time.sleep(wait_time)
+                    db.rollback()
+                    continue
+                else:
+                    raise
+            except Exception:
+                db.rollback()
+                raise
+    return None
+
+def get_tasks_by_session(db: Session, session_id: str, limit: int = 10) -> List[ReviewGenerationTask]:
+    """Get tasks for a specific session"""
+    return (
+        db.query(ReviewGenerationTask)
+        .filter(ReviewGenerationTask.session_id == session_id)
+        .order_by(desc(ReviewGenerationTask.created_at))
+        .limit(limit)
+        .all()
+    )
+
+
+# Multi-session review data functions
+
+def get_recent_valid_reviews(db: Session, limit: int = 10, days: int = 7) -> List[ReviewData]:
+    """Get recent valid review data across all sessions (not expired, completed)
+
+    Args:
+        db: Database session
+        limit: Maximum number of reviews to return
+        days: Look back this many days for review generation time
+
+    Returns:
+        List of valid ReviewData objects sorted by recency
+    """
+    now = datetime.utcnow()
+    cutoff_time = now - timedelta(days=days)
+
+    return (
+        db.query(ReviewData)
+        .filter(
+            ReviewData.generation_status == "completed",
+            ReviewData.expires_at > now,
+            ReviewData.generated_at >= cutoff_time
+        )
+        .order_by(desc(ReviewData.generated_at))
+        .limit(limit)
+        .all()
+    )
+
+
+def get_aggregated_review_data(db: Session, session_ids: Optional[List[str]] = None, limit: int = 10) -> Dict[str, Any]:
+    """Get aggregated review data from multiple sessions using new structured format
+
+    Args:
+        db: Database session
+        session_ids: Optional list of session IDs to include. If None, uses recent valid reviews.
+        limit: Maximum number of reviews to aggregate
+
+    Returns:
+        Dictionary with aggregated review data in new structured format
+    """
+    # Get review data for specified sessions or recent valid reviews
+    if session_ids:
+        review_data_list = (
+            db.query(ReviewData)
+            .filter(
+                ReviewData.session_id.in_(session_ids),
+                ReviewData.generation_status == "completed",
+                ReviewData.expires_at > datetime.utcnow()
+            )
+            .order_by(desc(ReviewData.generated_at))
+            .limit(limit)
+            .all()
+        )
+    else:
+        review_data_list = get_recent_valid_reviews(db, limit=limit)
+
+    if not review_data_list:
+        return {
+            "aggregated_summary": "No review data available.",
+            "review_groups": [],
+            "next_review_date": datetime.utcnow().isoformat(),
+            "session_count": 0,
+            "total_groups": 0,
+            "total_cards": 0,
+            "total_questions": 0,
+            "sessions": []
+        }
+
+    # Aggregate review groups across sessions
+    groups_by_name: Dict[str, Dict[str, Any]] = {}
+    session_info = []
+
+    for review_data in review_data_list:
+        # Record session info
+        session_info.append({
+            "session_id": review_data.session_id,
+            "generated_at": review_data.generated_at.isoformat() if review_data.generated_at else None,
+            "total_groups": review_data.total_groups if hasattr(review_data, 'total_groups') else 0,
+            "total_cards": review_data.total_cards if hasattr(review_data, 'total_cards') else 0,
+            "total_questions": review_data.total_questions if hasattr(review_data, 'total_questions') else 0
+        })
+
+        # Skip if no review groups
+        if not review_data.review_groups:
+            continue
+
+        # Process each review group
+        for group in review_data.review_groups:
+            if not isinstance(group, dict):
+                continue
+
+            group_name = group.get("group_name", "")
+            if not group_name:
+                group_name = group.get("group_id", "未命名分组")
+
+            # Initialize group if not exists
+            if group_name not in groups_by_name:
+                groups_by_name[group_name] = {
+                    "group_id": group.get("group_id", group_name.lower().replace(" ", "_")),
+                    "group_name": group_name,
+                    "group_description": group.get("group_description", f"关于{group_name}的复习内容"),
+                    "knowledge_cards": [],
+                    "quiz_questions": []
+                }
+
+            # Merge knowledge cards (deduplicate by content)
+            current_group = groups_by_name[group_name]
+            knowledge_cards = group.get("knowledge_cards", [])
+            if knowledge_cards:
+                for card in knowledge_cards:
+                    if not isinstance(card, dict):
+                        continue
+                    card_content = card.get("content", "") or card.get("text", "")
+                    # Deduplicate by content
+                    existing = False
+                    for existing_card in current_group["knowledge_cards"]:
+                        existing_content = existing_card.get("content", "") or existing_card.get("text", "")
+                        if existing_content.startswith(card_content[:50]):
+                            existing = True
+                            break
+                    if not existing and card_content:
+                        # Ensure card has required fields
+                        card_id = card.get("card_id", f"{group_name}_card_{len(current_group['knowledge_cards'])}")
+                        current_group["knowledge_cards"].append({
+                            "card_id": card_id,
+                            "content": card_content,
+                            "macro_group": group_name,
+                            "is_learned": False
+                        })
+
+            # Merge quiz questions (deduplicate by question text)
+            quiz_questions = group.get("quiz_questions", [])
+            if quiz_questions:
+                for question in quiz_questions:
+                    if not isinstance(question, dict):
+                        continue
+                    question_text = question.get("question", "")
+                    # Deduplicate by question text prefix
+                    existing = False
+                    for existing_q in current_group["quiz_questions"]:
+                        if existing_q.get("question", "").startswith(question_text[:50]):
+                            existing = True
+                            break
+                    if not existing and question_text:
+                        # Ensure question has required fields
+                        question_id = question.get("question_id", f"{group_name}_quiz_{len(current_group['quiz_questions'])}")
+                        current_group["quiz_questions"].append({
+                            "question_id": question_id,
+                            "question": question_text,
+                            "options": question.get("options", ["选项A", "选项B", "选项C", "选项D"]),
+                            "correct_answer": question.get("correct_answer", 0),
+                            "explanation": question.get("explanation", ""),
+                            "difficulty": question.get("difficulty", "medium"),
+                            "macro_group": group_name,
+                            "user_answer": None,
+                            "is_correct": None
+                        })
+
+    # Convert groups dict to list
+    aggregated_groups = list(groups_by_name.values())
+
+    # Limit groups and content
+    aggregated_groups = aggregated_groups[:8]  # Max 8 groups
+    for group in aggregated_groups:
+        group["knowledge_cards"] = group["knowledge_cards"][:10]  # Max 10 cards per group
+        group["quiz_questions"] = group["quiz_questions"][:5]     # Max 5 questions per group
+
+    # Calculate totals
+    total_cards = sum(len(group["knowledge_cards"]) for group in aggregated_groups)
+    total_questions = sum(len(group["quiz_questions"]) for group in aggregated_groups)
+
+    # Generate aggregated summary
+    if aggregated_groups:
+        group_names = [group["group_name"] for group in aggregated_groups[:3]]
+        aggregated_summary = f"整合复习数据来自 {len(session_info)} 个近期会话。"
+        aggregated_summary += f"包含 {len(aggregated_groups)} 个知识领域：{', '.join(group_names)}"
+        if len(aggregated_groups) > 3:
+            aggregated_summary += f" 等。"
+        aggregated_summary += f" 总计 {total_cards} 个知识卡片和 {total_questions} 个测验题目。"
+    else:
+        aggregated_summary = "近期会话中没有复习数据。"
+
+    # Calculate next review date (earliest from all reviews, or default)
+    next_review_dates = []
+    for review_data in review_data_list:
+        if review_data.next_review_date:
+            next_review_dates.append(review_data.next_review_date)
+
+    if next_review_dates:
+        next_review_date = min(next_review_dates)
+    else:
+        next_review_date = datetime.utcnow() + timedelta(days=1)
+
+    return {
+        "aggregated_summary": aggregated_summary,
+        "review_groups": aggregated_groups,
+        "next_review_date": next_review_date.isoformat(),
+        "session_count": len(session_info),
+        "total_groups": len(aggregated_groups),
+        "total_cards": total_cards,
+        "total_questions": total_questions,
+        "sessions": session_info
+    }

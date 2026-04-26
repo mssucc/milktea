@@ -1,0 +1,820 @@
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel, Field
+from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone, timedelta
+import logging
+
+from sqlalchemy.orm import Session
+from fastapi.responses import JSONResponse
+
+from backend.database.session import get_db
+from backend.database import crud
+from backend.utils.ignored_entities import ignored_entities_manager
+from backend.scheduler import schedule_review_generation
+from backend.utils.summarizer import conversation_summarizer
+from backend.utils.review_generator import review_generator
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# Request/Response Models
+
+class ReviewRequest(BaseModel):
+    """Request model for review generation with API configuration"""
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    recent_days: int = Field(default=3, ge=1, le=30, description="Number of recent days to consider")
+    top_n_recent: int = Field(default=3, ge=1, le=10, description="Top N recent entities to focus on")
+    max_questions: int = Field(default=10, ge=1, le=20, description="Maximum number of questions to generate")
+
+
+class ReviewQuestion(BaseModel):
+    id: int
+    question: str
+    options: List[str]
+    correct_answer: int
+    explanation: str
+    difficulty: str
+    entity_name: Optional[str] = None  # Associated entity
+    entity_type: Optional[str] = None  # Entity type
+
+
+class ReviewRecommendation(BaseModel):
+    id: int
+    type: str
+    title: str
+    description: str
+    estimated_time: str
+    due_date: str
+    priority: str
+    completed: bool
+    entity_name: Optional[str] = None  # Associated entity
+
+
+class ReviewEntity(BaseModel):
+    """Entity information for review"""
+    name: str
+    type: str
+    description: str
+    mention_count: int
+    importance_score: float
+    is_recent: bool = False  # Whether it's in recent top N entities
+
+
+class ReviewResponse(BaseModel):
+    session_id: str
+    summary: str
+    key_points: List[str]
+    questions: List[ReviewQuestion]
+    recommendations: List[ReviewRecommendation]
+    next_review_date: str
+    recent_entities: List[ReviewEntity]  # Top N recent entities
+    key_entities: List[ReviewEntity]  # Other important entities
+    total_entities_considered: int
+
+
+# Helper functions
+
+def convert_review_data_to_response(review_data) -> ReviewResponse:
+    """Convert ReviewData database object to ReviewResponse"""
+    # Convert JSON fields back to Python objects
+    key_points = review_data.key_points or []
+    questions = review_data.questions or []
+    recommendations = review_data.recommendations or []
+    recent_entities = review_data.recent_entities or []
+    key_entities = review_data.key_entities or []
+
+    # Convert ReviewEntity dictionaries to ReviewEntity objects
+    recent_entity_objects = [
+        ReviewEntity(
+            name=e.get("name", ""),
+            type=e.get("type", "concept"),
+            description=e.get("description", ""),
+            mention_count=e.get("mention_count", 1),
+            importance_score=e.get("importance_score", 1.0),
+            is_recent=e.get("is_recent", True)
+        )
+        for e in recent_entities
+    ]
+
+    key_entity_objects = [
+        ReviewEntity(
+            name=e.get("name", ""),
+            type=e.get("type", "concept"),
+            description=e.get("description", ""),
+            mention_count=e.get("mention_count", 1),
+            importance_score=e.get("importance_score", 1.0),
+            is_recent=e.get("is_recent", False)
+        )
+        for e in key_entities
+    ]
+
+    # Convert ReviewQuestion dictionaries to ReviewQuestion objects
+    question_objects = []
+    for i, q in enumerate(questions):
+        question_objects.append(
+            ReviewQuestion(
+                id=q.get("id", i + 1),
+                question=q.get("question", f"Question {i+1}"),
+                options=q.get("options", ["Option A", "Option B", "Option C", "Option D"]),
+                correct_answer=q.get("correct_answer", 0),
+                explanation=q.get("explanation", ""),
+                difficulty=q.get("difficulty", "medium"),
+                entity_name=q.get("entity_name"),
+                entity_type=q.get("entity_type")
+            )
+        )
+
+    # Convert ReviewRecommendation dictionaries to ReviewRecommendation objects
+    recommendation_objects = []
+    for i, r in enumerate(recommendations):
+        recommendation_objects.append(
+            ReviewRecommendation(
+                id=r.get("id", i + 1),
+                type=r.get("type", "review"),
+                title=r.get("title", f"Review Activity {i+1}"),
+                description=r.get("description", ""),
+                estimated_time=r.get("estimated_time", "10 minutes"),
+                due_date=r.get("due_date", ""),
+                priority=r.get("priority", "medium"),
+                completed=r.get("completed", False),
+                entity_name=r.get("entity_name")
+            )
+        )
+
+    return ReviewResponse(
+        session_id=review_data.session_id,
+        summary=review_data.summary or "",
+        key_points=key_points,
+        questions=question_objects,
+        recommendations=recommendation_objects,
+        next_review_date=review_data.next_review_date.isoformat() if review_data.next_review_date else datetime.now(timezone.utc).isoformat(),
+        recent_entities=recent_entity_objects,
+        key_entities=key_entity_objects,
+        total_entities_considered=len(recent_entities) + len(key_entities)
+    )
+
+
+def filter_ignored_entities(entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filter out ignored entities from the list"""
+    filtered = []
+    for entity in entities:
+        entity_name = entity.get("name", "")
+        if entity_name and not ignored_entities_manager.is_ignored(entity_name):
+            filtered.append(entity)
+    logger.debug(f"Filtered {len(entities) - len(filtered)} ignored entities")
+    return filtered
+
+
+def select_recent_top_entities(
+    entities: List[Dict[str, Any]],
+    top_n: int = 3
+) -> List[Dict[str, Any]]:
+    """Select top N entities by mention_count (for recent entities)"""
+    if not entities:
+        return []
+
+    # Sort by mention_count descending, then by importance_score descending
+    sorted_entities = sorted(
+        entities,
+        key=lambda x: (x.get("mention_count", 0), x.get("importance_score", 0.0)),
+        reverse=True
+    )
+
+    return sorted_entities[:top_n]
+
+
+def select_key_entities(
+    entities: List[Dict[str, Any]],
+    exclude_entities: List[Dict[str, Any]],
+    limit: int = 10
+) -> List[Dict[str, Any]]:
+    """Select key entities (excluding recent top entities) by importance_score"""
+    if not entities:
+        return []
+
+    exclude_names = {e.get("name", "") for e in exclude_entities}
+
+    # Filter out excluded entities
+    filtered = [e for e in entities if e.get("name", "") not in exclude_names]
+
+    # Sort by importance_score descending, then by mention_count descending
+    sorted_entities = sorted(
+        filtered,
+        key=lambda x: (x.get("importance_score", 0.0), x.get("mention_count", 0)),
+        reverse=True
+    )
+
+    return sorted_entities[:limit]
+
+
+def get_messages_for_entity(
+    db: Session,
+    session_id: str,
+    entity_name: str,
+    limit: int = 10
+) -> List[Dict[str, str]]:
+    """Get messages containing the entity (simple text search)"""
+    # This is a simplified implementation
+    # In a real system, you might want more sophisticated entity detection
+    messages = crud.get_messages_by_session(db, session_id, limit=100)
+
+    entity_lower = entity_name.lower()
+    relevant_messages = []
+
+    for msg in messages:
+        if entity_lower in msg.content.lower():
+            relevant_messages.append({
+                "role": msg.role,
+                "content": msg.content
+            })
+            if len(relevant_messages) >= limit:
+                break
+
+    return relevant_messages
+
+
+# Routes
+
+@router.post("/review/{session_id}", response_model=ReviewResponse)
+async def get_session_review(
+    session_id: str,
+    request: Optional[ReviewRequest] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Get review materials for a specific session.
+
+    This endpoint now uses cached review data when available. If no cached data exists,
+    it triggers background generation and returns 202 Accepted with task information.
+    """
+    if request is None:
+        request = ReviewRequest()
+
+    logger.info(f"Review request for session {session_id} with recent_days={request.recent_days}")
+
+    try:
+        # 1. Check for valid cached review data
+        cached_review = crud.get_valid_review_data(db, session_id)
+        if cached_review:
+            logger.info(f"Cache hit for session {session_id}, returning cached review")
+            return convert_review_data_to_response(cached_review)
+
+        # 2. Check if review is currently being generated
+        review_data = crud.get_review_data(db, session_id)
+        if review_data and review_data.generation_status == "generating":
+            logger.info(f"Review generation in progress for session {session_id}")
+            # Return 202 Accepted with task information
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "message": "Review generation in progress",
+                    "session_id": session_id,
+                    "status": "generating",
+                    "estimated_time": 120,  # Estimated time in seconds
+                    "poll_url": f"/api/review/{session_id}/status",
+                    "generated_at": review_data.generated_at.isoformat() if review_data.generated_at else None
+                }
+            )
+
+        # 3. Check if session exists (has messages)
+        messages = crud.get_messages_by_session(db, session_id, limit=1)
+        if not messages:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session {session_id} not found or has no messages"
+            )
+
+        # 4. Trigger background generation
+        logger.info(f"Triggering background review generation for session {session_id}")
+
+        # Prepare configuration for background task
+        config = {
+            "recent_days": request.recent_days,
+            "top_n_recent": request.top_n_recent,
+            "max_questions": request.max_questions,
+            "api_key": request.api_key,
+            "base_url": request.base_url,
+            "model": request.model,
+            "priority": 10  # Higher priority for user-initiated requests
+        }
+
+        # Schedule background generation
+        task_id = schedule_review_generation(session_id, config)
+
+        # 5. Return 202 Accepted with task information
+        return JSONResponse(
+            status_code=202,
+            content={
+                "message": "Review generation started",
+                "session_id": session_id,
+                "task_id": task_id,
+                "status": "pending",
+                "estimated_time": 120,  # Estimated time in seconds (2 minutes)
+                "poll_url": f"/api/review/{session_id}/status",
+                "config": {
+                    "recent_days": request.recent_days,
+                    "top_n_recent": request.top_n_recent,
+                    "max_questions": request.max_questions
+                }
+            }
+        )
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # Specific error for API key validation or configuration issues
+        logger.error(f"Configuration error for session {session_id}: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"API configuration error: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Error processing review request for session {session_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process review request: {str(e)}"
+        )
+
+
+@router.get("/review/{session_id}/questions", response_model=List[ReviewQuestion])
+async def get_review_questions(session_id: str, db: Session = Depends(get_db)):
+    """Get review questions for a session (legacy endpoint)"""
+    try:
+        logger.info(f"Getting review questions for session: {session_id}")
+
+        # Check for cached review data
+        cached_review = crud.get_valid_review_data(db, session_id)
+        if cached_review and hasattr(cached_review, 'questions'):
+            # Get questions data safely
+            questions_data = getattr(cached_review, 'questions', None)
+            if questions_data is None:
+                questions_data = []
+            elif isinstance(questions_data, list):
+                questions_data = questions_data
+            else:
+                # Handle case where questions_data might be a Column or other type
+                questions_data = []
+
+            # Convert cached questions to ReviewQuestion objects
+            question_objects = []
+            for i, q in enumerate(questions_data):
+                question_objects.append(
+                    ReviewQuestion(
+                        id=q.get("id", i + 1),
+                        question=q.get("question", f"Question {i+1}"),
+                        options=q.get("options", ["Option A", "Option B", "Option C", "Option D"]),
+                        correct_answer=q.get("correct_answer", 0),
+                        explanation=q.get("explanation", ""),
+                        difficulty=q.get("difficulty", "medium"),
+                        entity_name=q.get("entity_name"),
+                        entity_type=q.get("entity_type")
+                    )
+                )
+            return question_objects
+
+        # If no cached data, return empty list or trigger generation
+        logger.warning(f"No cached review questions found for session {session_id}")
+        return []
+
+    except Exception as e:
+        logger.error(f"Error getting review questions: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/review/{session_id}/complete")
+async def mark_review_completed(
+    session_id: str,
+    review_item_id: int
+):
+    """Mark a review item as completed"""
+    try:
+        logger.info(f"Marking review item {review_item_id} as completed for session {session_id}")
+        # Placeholder implementation
+        return {"message": f"Review item {review_item_id} marked as completed"}
+    except Exception as e:
+        logger.error(f"Error marking review as completed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/review/{session_id}/schedule")
+async def get_review_schedule(session_id: str):
+    """Get spaced repetition schedule for a session"""
+    try:
+        logger.info(f"Getting review schedule for session: {session_id}")
+        schedule = review_generator.generate_spaced_repetition_schedule([], session_id)
+        return schedule
+    except Exception as e:
+        logger.error(f"Error getting review schedule: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# New endpoints for review status and management
+
+@router.get("/review/{session_id}/status")
+async def get_review_status(session_id: str, db: Session = Depends(get_db)):
+    """Get review generation status for a session"""
+    try:
+        logger.info(f"Getting review status for session: {session_id}")
+
+        # Check for cached review data
+        cached_review = crud.get_valid_review_data(db, session_id)
+        if cached_review:
+            # Safely get datetime values
+            generated_at = getattr(cached_review, 'generated_at', None)
+            expires_at = getattr(cached_review, 'expires_at', None)
+            review_count = getattr(cached_review, 'review_count', 0)
+
+            return {
+                "session_id": session_id,
+                "status": "completed",
+                "generated_at": generated_at.isoformat() if generated_at is not None else None,
+                "expires_at": expires_at.isoformat() if expires_at is not None else None,
+                "review_count": review_count,
+                "has_cache": True
+            }
+
+        # Check current generation status
+        review_data = crud.get_review_data(db, session_id)
+        if review_data:
+            # Safely get attributes
+            generation_status = getattr(review_data, 'generation_status', 'unknown')
+            generated_at = getattr(review_data, 'generated_at', None)
+            last_attempt_at = getattr(review_data, 'last_attempt_at', None)
+            error_message = getattr(review_data, 'error_message', None)
+
+            return {
+                "session_id": session_id,
+                "status": generation_status,
+                "generated_at": generated_at.isoformat() if generated_at is not None else None,
+                "last_attempt_at": last_attempt_at.isoformat() if last_attempt_at is not None else None,
+                "error_message": error_message,
+                "has_cache": False
+            }
+
+        # No review data at all
+        return {
+            "session_id": session_id,
+            "status": "not_started",
+            "has_cache": False,
+            "message": "No review data found for this session"
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting review status: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/review/{session_id}/regenerate")
+async def regenerate_review(
+    session_id: str,
+    request: Optional[ReviewRequest] = None,
+    db: Session = Depends(get_db)
+):
+    """Manually trigger review regeneration for a session"""
+    if request is None:
+        request = ReviewRequest()
+
+    logger.info(f"Manual review regeneration requested for session {session_id}")
+
+    try:
+        # Delete existing review data if it exists
+        crud.delete_review_data(db, session_id)
+
+        # Prepare configuration for background task
+        config = {
+            "recent_days": request.recent_days,
+            "top_n_recent": request.top_n_recent,
+            "max_questions": request.max_questions,
+            "api_key": request.api_key,
+            "base_url": request.base_url,
+            "model": request.model,
+            "priority": 15  # High priority for manual requests
+        }
+
+        # Schedule background generation
+        task_id = schedule_review_generation(session_id, config)
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "message": "Review regeneration started",
+                "session_id": session_id,
+                "task_id": task_id,
+                "status": "pending",
+                "estimated_time": 120,
+                "poll_url": f"/api/review/{session_id}/status",
+                "config": {
+                    "recent_days": request.recent_days,
+                    "top_n_recent": request.top_n_recent,
+                    "max_questions": request.max_questions
+                }
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Error triggering review regeneration: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to trigger review regeneration: {str(e)}"
+        )
+
+
+# New endpoints for ignored entities management
+
+@router.get("/review/ignored-entities")
+async def get_ignored_entities():
+    """Get list of ignored entities"""
+    try:
+        ignored = ignored_entities_manager.get_ignored_entities()
+        return {"ignored_entities": ignored, "count": len(ignored)}
+    except Exception as e:
+        logger.error(f"Error getting ignored entities: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/review/ignored-entities/{entity_name}")
+async def add_ignored_entity(entity_name: str):
+    """Add an entity to the ignored list"""
+    try:
+        success = ignored_entities_manager.add_ignored_entity(entity_name)
+        if success:
+            return {"message": f"Entity '{entity_name}' added to ignored list"}
+        else:
+            raise HTTPException(status_code=400, detail="Failed to add entity to ignored list")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding ignored entity: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.delete("/review/ignored-entities/{entity_name}")
+async def remove_ignored_entity(entity_name: str):
+    """Remove an entity from the ignored list"""
+    try:
+        success = ignored_entities_manager.remove_ignored_entity(entity_name)
+        if success:
+            return {"message": f"Entity '{entity_name}' removed from ignored list"}
+        else:
+            raise HTTPException(status_code=400, detail="Failed to remove entity from ignored list")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error removing ignored entity: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# Integrated review endpoints (multi-session)
+
+class IntegratedReviewRequest(BaseModel):
+    """Request model for integrated review generation"""
+    limit: int = Field(default=10, ge=1, le=50, description="Maximum number of sessions to include")
+    days: int = Field(default=7, ge=1, le=30, description="Look back this many days for review data")
+    force_refresh: bool = Field(default=False, description="Force refresh of cached data")
+    api_key: Optional[str] = Field(default=None, description="API key for LLM calls (optional, uses backend default if not provided)")
+    base_url: Optional[str] = Field(default=None, description="Base URL for LLM API (optional)")
+    model: Optional[str] = Field(default=None, description="Model name for LLM calls (optional)")
+
+
+class IntegratedReviewResponse(BaseModel):
+    """Response model for integrated review data"""
+    aggregated_summary: str
+    aggregated_key_points: List[str]
+    aggregated_questions: List[ReviewQuestion]
+    aggregated_recommendations: List[ReviewRecommendation]
+    aggregated_entities: List[ReviewEntity]
+    next_review_date: str
+    session_count: int
+    total_questions: int
+    total_recommendations: int
+    sessions: List[Dict[str, Any]]
+
+
+@router.post("/review/integrated/overview", response_model=IntegratedReviewResponse)
+async def get_integrated_review(
+    request: Optional[IntegratedReviewRequest] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Get integrated review data across multiple sessions.
+
+    This endpoint aggregates review data from recent sessions to provide
+    a comprehensive overview of learning topics, questions, and recommendations.
+    It does not depend on a specific session selection.
+
+    If force_refresh is True, it will trigger background regeneration for
+    sessions that need updated review data before returning aggregated results.
+    """
+    if request is None:
+        request = IntegratedReviewRequest()
+
+    logger.info(f"Integrated review request with limit={request.limit}, days={request.days}, force_refresh={request.force_refresh}")
+
+    # If force refresh is requested, check if we need to trigger regeneration
+    if request.force_refresh:
+        # Get recent sessions that have review data
+        recent_reviews = crud.get_recent_valid_reviews(db, limit=request.limit, days=request.days)
+
+        # Filter sessions that need regeneration (expired or no valid cache)
+        sessions_needing_regeneration = []
+        for review in recent_reviews:
+            # Check if review is expired or about to expire (within 1 hour)
+            if review.expires_at and review.expires_at <= datetime.now(timezone.utc) + timedelta(hours=1):
+                sessions_needing_regeneration.append(review.session_id)
+
+        # If no sessions need regeneration, check for sessions without review data
+        if not sessions_needing_regeneration:
+            # Get recent sessions without review data
+            recent_sessions = crud.get_recent_sessions(db, limit=request.limit, days=request.days)
+            for session in recent_sessions:
+                review_data = crud.get_review_data(db, session.id)
+                if not review_data or review_data.generation_status != "completed":
+                    sessions_needing_regeneration.append(session.id)
+
+        # Trigger background regeneration for sessions that need it
+        if sessions_needing_regeneration:
+            logger.info(f"Force refresh: triggering regeneration for {len(sessions_needing_regeneration)} sessions")
+
+            # Schedule regeneration for each session
+            task_ids = []
+            for session_id in sessions_needing_regeneration[:5]:  # Limit to 5 sessions to avoid overload
+                # Delete existing review data to force regeneration
+                crud.delete_review_data(db, session_id)
+
+                # Schedule regeneration with API configuration from request
+                config = {
+                    "priority": 20,  # High priority
+                    "api_key": request.api_key,
+                    "base_url": request.base_url,
+                    "model": request.model
+                }
+                task_id = schedule_review_generation(session_id, config)
+                task_ids.append({"session_id": session_id, "task_id": task_id})
+
+            # Return 202 Accepted with task information
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "message": "Review regeneration started for integrated overview",
+                    "regenerating_sessions": sessions_needing_regeneration[:5],
+                    "task_ids": task_ids,
+                    "total_sessions": len(sessions_needing_regeneration),
+                    "estimated_time": 300,  # 5 minutes estimate
+                    "poll_url": f"/api/review/integrated/overview?limit={request.limit}&days={request.days}&force_refresh=false"
+                }
+            )
+
+    try:
+        # Get aggregated review data
+        aggregated_data = crud.get_aggregated_review_data(
+            db=db,
+            session_ids=None,  # Use recent valid reviews
+            limit=request.limit
+        )
+
+        # Convert entities to ReviewEntity objects
+        aggregated_entity_objects = []
+        for entity in aggregated_data.get("aggregated_entities", []):
+            aggregated_entity_objects.append(
+                ReviewEntity(
+                    name=entity.get("name", ""),
+                    type=entity.get("type", "concept"),
+                    description=entity.get("description", ""),
+                    mention_count=entity.get("mention_count", 1),
+                    importance_score=entity.get("importance_score", 1.0),
+                    is_recent=entity.get("is_recent", False)
+                )
+            )
+
+        # Convert questions to ReviewQuestion objects
+        aggregated_question_objects = []
+        questions_data = aggregated_data.get("aggregated_questions", [])
+        for i, q in enumerate(questions_data):
+            aggregated_question_objects.append(
+                ReviewQuestion(
+                    id=q.get("id", i + 1),
+                    question=q.get("question", f"Question {i+1}"),
+                    options=q.get("options", ["Option A", "Option B", "Option C", "Option D"]),
+                    correct_answer=q.get("correct_answer", 0),
+                    explanation=q.get("explanation", ""),
+                    difficulty=q.get("difficulty", "medium"),
+                    entity_name=q.get("entity_name"),
+                    entity_type=q.get("entity_type")
+                )
+            )
+
+        # Convert recommendations to ReviewRecommendation objects
+        aggregated_recommendation_objects = []
+        recommendations_data = aggregated_data.get("aggregated_recommendations", [])
+        for i, r in enumerate(recommendations_data):
+            aggregated_recommendation_objects.append(
+                ReviewRecommendation(
+                    id=r.get("id", i + 1),
+                    type=r.get("type", "review"),
+                    title=r.get("title", f"Review Activity {i+1}"),
+                    description=r.get("description", ""),
+                    estimated_time=r.get("estimated_time", "10 minutes"),
+                    due_date=r.get("due_date", ""),
+                    priority=r.get("priority", "medium"),
+                    completed=r.get("completed", False),
+                    entity_name=r.get("entity_name")
+                )
+            )
+
+        # Return integrated review response
+        return IntegratedReviewResponse(
+            aggregated_summary=aggregated_data.get("aggregated_summary", ""),
+            aggregated_key_points=aggregated_data.get("aggregated_key_points", []),
+            aggregated_questions=aggregated_question_objects,
+            aggregated_recommendations=aggregated_recommendation_objects,
+            aggregated_entities=aggregated_entity_objects,
+            next_review_date=aggregated_data.get("next_review_date", datetime.now(timezone.utc).isoformat()),
+            session_count=aggregated_data.get("session_count", 0),
+            total_questions=aggregated_data.get("total_questions", 0),
+            total_recommendations=aggregated_data.get("total_recommendations", 0),
+            sessions=aggregated_data.get("sessions", [])
+        )
+
+    except Exception as e:
+        logger.error(f"Error getting integrated review: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get integrated review: {str(e)}"
+        )
+
+
+@router.get("/review/integrated/sessions")
+async def get_sessions_with_reviews(db: Session = Depends(get_db)):
+    """Get list of sessions that have valid review data"""
+    try:
+        recent_reviews = crud.get_recent_valid_reviews(db, limit=50, days=30)
+
+        sessions = []
+        for review in recent_reviews:
+            # Safely handle potentially None values
+            generated_at = None
+            if review.generated_at is not None:
+                generated_at = review.generated_at.isoformat()
+
+            expires_at = None
+            if review.expires_at is not None:
+                expires_at = review.expires_at.isoformat()
+
+            # Handle JSON fields - use getattr to avoid type check issues
+            key_points_data = getattr(review, 'key_points', None)
+            questions_data = getattr(review, 'questions', None)
+            recommendations_data = getattr(review, 'recommendations', None)
+            summary_data = getattr(review, 'summary', None)
+
+            key_points_list = []
+            if key_points_data is not None and isinstance(key_points_data, list):
+                key_points_list = key_points_data
+
+            questions_list = []
+            if questions_data is not None and isinstance(questions_data, list):
+                questions_list = questions_data
+
+            recommendations_list = []
+            if recommendations_data is not None and isinstance(recommendations_data, list):
+                recommendations_list = recommendations_data
+
+            key_points_count = len(key_points_list)
+            questions_count = len(questions_list)
+            recommendations_count = len(recommendations_list)
+
+            summary_text = ""
+            if summary_data is not None and isinstance(summary_data, str):
+                summary_text = summary_data
+
+            if summary_text and len(summary_text) > 100:
+                summary_preview = summary_text[:100] + "..."
+            else:
+                summary_preview = summary_text
+
+            sessions.append({
+                "session_id": review.session_id,
+                "generated_at": generated_at,
+                "expires_at": expires_at,
+                "key_points_count": key_points_count,
+                "questions_count": questions_count,
+                "recommendations_count": recommendations_count,
+                "summary_preview": summary_preview
+            })
+
+        return {
+            "sessions": sessions,
+            "total_count": len(sessions),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting sessions with reviews: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get sessions with reviews: {str(e)}"
+        )

@@ -1,0 +1,34 @@
+/* assets/styles/cute.css */
+@import url('https://fonts.googleapis.com/css2?family=Quicksand:wght@400;600&display=swap');
+
+* {
+  font-family: 'Quicksand', 'Comic Neue', '圆体', sans-serif;
+}
+
+body {
+  background: linear-gradient(135deg, #fff0f5 0%, #ffe4ed 100%);
+  background-attachment: fixed;
+}
+
+.chat-bubble-user {
+  @apply bg-mint-200 rounded-3xl rounded-br-none p-3 max-w-[80%] ml-auto;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+}
+
+.chat-bubble-bot {
+  @apply bg-white rounded-3xl rounded-bl-none p-3 max-w-[80%] border border-pink-200;
+  position: relative;
+}
+
+.chat-bubble-bot::before {
+  content: "🐱";
+  position: absolute;
+  left: -20px;
+  top: -10px;
+  font-size: 24px;
+}
+
+/* 按钮动画 */
+.btn-cute {
+  @apply transition-all duration-200 hover:scale-105 active:scale-95;
+}
