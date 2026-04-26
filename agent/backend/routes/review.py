@@ -676,11 +676,17 @@ async def get_integrated_review_overview(
                         ReviewData.expires_at > datetime.utcnow()
                     ).first()
                     if existing_review:
-                        # Check if there are new messages since the review was generated
+                        # Session has existing valid review — check if it's time to refresh
                         last_message = crud.get_last_message(db, session_id)
                         if (last_message and existing_review.generated_at
                                 and last_message.timestamp > existing_review.generated_at):
-                            logger.debug(f"Session {session_id} has new messages since review, will regenerate")
+                            # Session has new messages — only regenerate if review is old enough
+                            review_age_days = (datetime.utcnow() - existing_review.generated_at).days
+                            if review_age_days >= 7:
+                                logger.debug(f"Session {session_id} has new messages, review is {review_age_days} days old, regenerating")
+                            else:
+                                logger.debug(f"Session {session_id} has new messages but review is only {review_age_days} days old, keeping existing")
+                                continue
                         else:
                             logger.debug(f"Session {session_id} already has valid review, skipping")
                             continue
