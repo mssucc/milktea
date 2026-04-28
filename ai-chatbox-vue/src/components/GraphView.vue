@@ -400,15 +400,15 @@ const connectedNodes = computed(() => {
 // Methods
 const getGroupColor = (group: string) => {
   const colorMap: Record<string, string> = {
-    'concept': '#6B5B95',      // 深紫色
-    'technique': '#4A7C9B',    // 深青蓝色
-    'application': '#2E8B57',  // 深绿色
-    'person': '#D2691E',       // 深橙色
-    'organization': '#C44536', // 深红色
-    'location': '#228B22',     // 森林绿
-    'tool': '#5D4E75',         // 深紫灰
-    'event': '#B8860B',        // 深金色
-    'default': '#5A5A5A'       // 深灰色
+    'concept': '#A99BC8',      // 柔薰衣草
+    'technique': '#8BB8D9',    // 柔天蓝
+    'application': '#8FC9A8',  // 柔鼠尾草
+    'person': '#E8B88A',       // 柔蜜桃
+    'organization': '#D9A0A0', // 柔玫瑰
+    'location': '#8FC9C0',     // 柔青碧
+    'tool': '#C8A8D8',         // 柔丁香
+    'event': '#D9C888',        // 柔金黄
+    'default': '#B8B8B8'       // 柔灰
   }
   return colorMap[group] || colorMap.default
 }
@@ -521,8 +521,8 @@ const prepareGraphData = (rawNodes: any[], rawEdges: any[]) => {
           background: getGroupColor(node.group || 'default'),
           border: '#FFFFFF',
           highlight: {
-            background: '#FFD700',
-            border: '#FFA500'
+            background: '#D9C888',
+            border: '#A99BC8'
           }
         },
         font: {
@@ -549,9 +549,9 @@ const prepareGraphData = (rawNodes: any[], rawEdges: any[]) => {
     rawEdges.map((edge: any) => ({
       ...edge,
       color: {
-        color: '#9C89B8',
-        highlight: '#7A6B9C',
-        hover: '#B8D0EB'
+        color: '#C8B8D8',
+        highlight: '#A99BC8',
+        hover: '#D9C888'
       },
       arrows: 'to',
       smooth: true
@@ -989,11 +989,11 @@ const initGraph = () => {
         },
         solver: 'barnesHut',
         barnesHut: {
-          gravitationalConstant: -2000,  // Reduced magnitude for less strong attraction
-          springConstant: 0.05,         // Reduced spring constant for smoother movement
-          springLength: 150,            // Slightly shorter spring length
-          centralGravity: 0.3,          // Add central gravity to keep nodes centered
-          damping: 0.08                 // Add damping to reduce oscillations
+          gravitationalConstant: -1200,  // Reduced attraction to prevent clumping
+          springConstant: 0.04,
+          springLength: 200,            // Longer springs for more spacing
+          centralGravity: 0.15,         // Lighter center pull to spread out
+          damping: 0.09
         }
       },
       interaction: {

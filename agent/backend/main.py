@@ -8,7 +8,7 @@ from backend.routes import chat, graph, review, models
 from backend.config import DATABASE_URL, NEO4J_URI
 from backend.database.session import init_db, engine
 from backend.graph_db.neo4j_client import init_neo4j
-from backend.scheduler import init_scheduler, shutdown_scheduler, schedule_periodic_scans
+from backend.scheduler import init_scheduler, shutdown_scheduler, schedule_periodic_scans, schedule_startup_catchup_scan
 from backend.scheduler.config import scheduler
 # Import models to register with SQLAlchemy Base
 from backend.database import model
@@ -62,6 +62,7 @@ async def startup_event():
     try:
         init_scheduler()
         schedule_periodic_scans()
+        schedule_startup_catchup_scan()
         print("Scheduler initialized and periodic scans scheduled")
     except Exception as e:
         logger.error(f"Failed to initialize scheduler: {e}")

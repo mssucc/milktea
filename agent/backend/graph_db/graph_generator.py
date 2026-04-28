@@ -31,17 +31,17 @@ class GraphGenerator:
     def _get_group_color(self, group: str) -> str:
         """Get color for entity group"""
         color_map = {
-            "concept": "#9C89B8",      # Purple
-            "technique": "#B8D0EB",    # Light blue
-            "application": "#87CEB3",  # Green
-            "person": "#FFB347",       # Orange
-            "organization": "#FF6961", # Red
-            "tool": "#77DD77",         # Light green
-            "location": "#FDFD96",     # Yellow
-            "event": "#FFD700",        # Gold
-            "default": "#A9A9A9",      # Gray
+            "concept": "#A99BC8",      # Soft lavender
+            "technique": "#8BB8D9",    # Soft sky blue
+            "application": "#8FC9A8",  # Soft sage
+            "person": "#E8B88A",       # Soft peach
+            "organization": "#D9A0A0", # Soft rose
+            "tool": "#C8A8D8",         # Soft lilac
+            "location": "#8FC9C0",     # Soft teal
+            "event": "#D9C888",        # Soft gold
+            "default": "#B8B8B8",      # Soft gray
         }
-        return color_map.get(group, "#A9A9A9")
+        return color_map.get(group, "#B8B8B8")
 
     def generate_session_graph(self, session_id: str) -> Dict[str, Any]:
         """Generate graph data for a specific session from Neo4j"""

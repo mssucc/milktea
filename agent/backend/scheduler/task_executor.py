@@ -139,6 +139,31 @@ def schedule_periodic_scans():
     return job
 
 
+def schedule_startup_catchup_scan():
+    """
+    Schedule an immediate one-time catch-up scan on backend startup.
+
+    This compensates for missed periodic scans while the backend was offline.
+    Sessions with reviews > 7 days old that have new messages will be regenerated.
+    """
+    from .config import scheduler
+
+    job_id = f"startup_catchup_{int(datetime.utcnow().timestamp())}"
+
+    job = scheduler.add_job(
+        execute_scheduled_scan,
+        'date',
+        run_date=datetime.utcnow(),
+        id=job_id,
+        misfire_grace_time=600,
+        coalesce=True,
+        replace_existing=True
+    )
+
+    logger.info(f"Scheduled startup catch-up scan (job {job_id})")
+    return job_id
+
+
 def schedule_retry_task(session_id: str, delay_minutes: int = 5):
     """
     Schedule a retry task for failed review generation.

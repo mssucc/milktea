@@ -7,6 +7,7 @@ from .task_executor import (
     execute_scheduled_scan,
     schedule_review_generation,
     schedule_periodic_scans,
+    schedule_startup_catchup_scan,
     schedule_retry_task,
     execute_integrated_review_generation_task,
     schedule_integrated_review_generation
@@ -21,6 +22,7 @@ __all__ = [
     'execute_scheduled_scan',
     'schedule_review_generation',
     'schedule_periodic_scans',
+    'schedule_startup_catchup_scan',
     'schedule_retry_task',
     'execute_integrated_review_generation_task',
     'schedule_integrated_review_generation'

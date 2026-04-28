@@ -90,9 +90,16 @@ def needs_review_generation(db: Session, session_id: str) -> bool:
         return True
 
     if review_data.generation_status == "completed":
-        # Check if expired
+        # Check if cache expired (24h)
         if review_data.expires_at and review_data.expires_at <= now:
             return True
+
+        # Check if review is old enough (> 7 days) AND has new messages
+        # Fresh reviews (< 7 days) are kept even with new messages to preserve progress
+        if review_data.generated_at and (now - review_data.generated_at).days >= 7:
+            last_message = crud.get_last_message(db, session_id)
+            if last_message and last_message.timestamp > review_data.generated_at:
+                return True
 
     return False
 
