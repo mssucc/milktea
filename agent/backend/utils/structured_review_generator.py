@@ -92,6 +92,7 @@ class StructuredReviewGenerator:
 要求：
 - 分组应基于宏观主题，而不是每个具体知识点单独分组
 - 每个分组应有2-4个知识卡片和2-3个选择题
+- **分组标题必须自包含，能独立看出内容范围。** 好的标题如"豪鬼核心机制与招式"、"Pandas数据清洗常用操作"；不好的标题如"三者核心区别"、"基本概念介绍"、"重要知识点"。标题应体现具体的主体/人物/技术名称。
 - 知识卡片应是对话核心内容的简洁总结，易于记忆
 - 选择题应测试概念理解，而不是单纯记忆，科技常识适合出选择题
 - 选择题应有4个选项，指定正确答案索引（0-3）
@@ -310,9 +311,292 @@ class StructuredReviewGenerator:
 
         return validated
 
+    def generate_note_review(self, markdown_content: str, note_id: str,
+                             api_key: Optional[str] = None, base_url: Optional[str] = None,
+                             model: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Generate structured review data from a markdown learning note.
+        Uses the same output format as generate_structured_review.
+        """
+        logger.info(f"Generating note review for {note_id} ({len(markdown_content)} chars)")
+
+        try:
+            llm = self._create_llm(api_key, base_url, model)
+
+            system_prompt = """你是一位专业的学习助教，负责将技术学习笔记转化为复习材料。
+
+你会收到一份技术学习笔记（Markdown格式），通常包含：
+- 对某个技术主题的深入分析
+- 源码引用和代码片段
+- 概念解释和原理推导
+- 已有的Q&A
+
+你的任务是基于笔记内容生成结构化的复习数据。重要原则：
+- 基于笔记内容，但不要简单复述——要重新组织、提炼、补充关联知识
+- 对于笔记中已有的Q&A，不要直接复用，而是从新的角度或更深的层次出题
+- 利用你自己的知识补充笔记中没有明确写出但相关的背景知识
+- 选择题应测试真正的理解，而非记忆
+
+输出格式必须是严格有效的JSON："""
+
+            user_prompt = f"""请分析以下技术学习笔记，生成结构化复习数据：
+
+===== 笔记内容 =====
+{markdown_content}
+
+请按照以下JSON格式输出：
+
+{{
+  "aggregated_summary": "对笔记内容的总体概括，2-3句话，点明核心主题和关键收获",
+  "review_groups": [
+    {{
+      "id": "unique_group_id",  // 英文小写+下划线，如"kv_cache_design"
+      "title": "分组标题，体现具体技术名称，如'KV Cache的累积哈希链设计'",
+      "description": "本组知识点的简要说明",
+      "knowledge_cards": [
+        {{
+          "id": "card_1",
+          "content": "知识卡片内容，简洁总结一个关键知识点。重新组织笔记内容，而非照抄原文"
+        }}
+      ],
+      "quiz_questions": [
+        {{
+          "id": "quiz_1",
+          "question": "选择题问题，测试理解而非记忆",
+          "options": ["选项A", "选项B", "选项C", "选项D"],
+          "correct_answer": 0,
+          "explanation": "答案解析，说明为什么正确以及干扰项为什么错误",
+          "difficulty": "medium"
+        }}
+      ]
+    }}
+  ]
+}}
+
+请确保：
+1. 笔记中每个大章节（## 标题）通常对应一个review_group
+2. 每个group的knowledge_cards覆盖该章节的核心知识点（2-4个）
+3. 每个group的quiz_questions测试关键概念的理解（2-3个），不要与笔记中已有的Q&A完全相同
+4. 利用你的知识补充背景和关联概念，让复习材料比原始笔记更丰富
+5. 选择题的干扰项应有区分度，避免明显的错误选项"""
+
+            response = llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt)
+            ])
+
+            try:
+                content = response.content.strip()
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0].strip()
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0].strip()
+
+                result = json.loads(content)
+                validated_result = self._validate_and_enhance_result(result, note_id, 0)
+
+                logger.info(f"Successfully generated note review for {note_id}")
+                logger.info(f"  Groups: {validated_result.get('total_groups', 0)}")
+                logger.info(f"  Knowledge cards: {validated_result.get('total_knowledge_cards', 0)}")
+                logger.info(f"  Quiz questions: {validated_result.get('total_quiz_questions', 0)}")
+
+                return validated_result
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse LLM response as JSON: {e}")
+                return self._generate_fallback_data(note_id, 0)
+
+        except Exception as e:
+            logger.error(f"Error generating note review for {note_id}: {e}")
+            return self._generate_fallback_data(note_id, 0)
+
+    def audit_review(self, review_data: Dict[str, Any], messages: List[Dict[str, str]],
+                     api_key: Optional[str] = None, base_url: Optional[str] = None,
+                     model: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Phase 2: Independently audit generated review content against source conversation.
+
+        Each knowledge card and quiz question is checked for factual correctness.
+        Items are marked pass (keep as-is), fix (corrected version provided), or remove (drop).
+
+        Returns the verified review data with only passing or corrected items.
+        """
+        review_groups = review_data.get("review_groups", [])
+        total_cards = sum(len(g.get("knowledge_cards", [])) for g in review_groups)
+        total_quizzes = sum(len(g.get("quiz_questions", [])) for g in review_groups)
+
+        if not review_groups or (total_cards == 0 and total_quizzes == 0):
+            logger.info("No review content to audit, skipping verification phase")
+            return review_data
+
+        logger.info(f"Auditing review: {len(review_groups)} groups, {total_cards} cards, {total_quizzes} quizzes")
+
+        try:
+            llm = self._create_llm(api_key, base_url, model)
+
+            conversation_text = ""
+            for msg in messages:
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                conversation_text += f"{role}: {content}\n\n"
+
+            review_json = json.dumps(review_groups, ensure_ascii=False, indent=2)
+
+            system_prompt = """你是一位严格的知识审核员。你的任务是独立审核AI生成的复习内容，逐项检查其事实准确性。
+
+你将收到：
+1. 原始对话记录（source of truth）
+2. AI生成的复习内容（需要审核的知识卡片和选择题）
+
+审核原则：
+- **pass（通过）**: 内容与对话事实完全一致，没有错误
+- **fix（修正）**: 内容有细微错误或不精确之处，但可以修正。提供修正后的版本
+- **remove（移除）**: 内容存在根本性错误、完全捏造、或无法从对话中找到依据。这类内容应当删除
+
+审核标准：
+- 知识卡片：检查每个陈述是否能在对话中找到明确依据。对话中未提及的、推测的、或错误概括的都应标记
+- 选择题：检查题干是否正确、正确答案是否真的正确、干扰项是否合理、解析是否准确
+- 特别注意：不要因为表述方式不同就标记为错误，只修正事实性错误
+- 对于格斗游戏等专业领域，角色数据（血量、招式、帧数等）必须与对话中明确提到的完全一致
+
+输出格式必须是严格的JSON：
+{
+  "audit_summary": "审核总结，2-3句话概括发现问题",
+  "verified_groups": [
+    // 与输入结构相同，但只包含通过审核和修正后的项目
+    // 被标记为remove的项目不出现在输出中
+  ]
+}
+
+对于每个知识卡片，在输出中保持不变的结构，但在需要修正时直接输出修正后的content。
+对于每个选择题，同样保持结构，需要修正时修正对应字段。
+不要在输出中添加审核标记字段，直接输出最终审核后的干净数据。"""
+
+            user_prompt = f"""请严格审核以下复习内容是否与对话记录一致。
+
+===== 原始对话记录 =====
+{conversation_text}
+
+===== 待审核的复习内容 =====
+{review_json}
+
+请逐项审核每个知识卡片和选择题：
+1. 知识卡片内容是否能在对话中找到明确依据？
+2. 选择题的正确答案是否真的是正确答案？解析是否准确？
+3. 有没有捏造、推测、或与对话矛盾的内容？
+
+请输出审核后的JSON，只保留通过和修正后的项目。被移除的项目直接不在输出中出现。"""
+
+            response = llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt)
+            ])
+
+            content = response.content.strip()
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+
+            audit_result = json.loads(content)
+            verified_groups = audit_result.get("verified_groups", [])
+            audit_summary = audit_result.get("audit_summary", "")
+
+            # Validate the verified groups have the right structure
+            validated_groups = self._validate_review_groups(verified_groups)
+
+            # Compute statistics
+            verified_cards = sum(len(g.get("knowledge_cards", [])) for g in validated_groups)
+            verified_quizzes = sum(len(g.get("quiz_questions", [])) for g in validated_groups)
+            removed_cards = total_cards - verified_cards
+            removed_quizzes = total_quizzes - verified_quizzes
+
+            logger.info(
+                f"Audit complete: {verified_cards}/{total_cards} cards kept ({removed_cards} removed), "
+                f"{verified_quizzes}/{total_quizzes} quizzes kept ({removed_quizzes} removed)"
+            )
+            if audit_summary:
+                logger.info(f"Audit summary: {audit_summary}")
+
+            # Update review_data with verified content
+            review_data["review_groups"] = validated_groups
+            review_data["total_groups"] = len(validated_groups)
+            review_data["total_knowledge_cards"] = verified_cards
+            review_data["total_quiz_questions"] = verified_quizzes
+            review_data["audit_summary"] = audit_summary
+
+            return review_data
+
+        except Exception as e:
+            logger.error(f"Audit phase failed: {e}, returning unverified review data")
+            return review_data
+
+    def _validate_review_groups(self, groups: List[Dict]) -> List[Dict]:
+        """Validate and clean review groups without re-adding metadata (used for audit output)."""
+        validated_groups = []
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+
+            group_id = group.get("id", "")
+            title = group.get("title", "")
+            description = group.get("description", "")
+
+            if not group_id or not title:
+                continue
+
+            knowledge_cards = []
+            for card in group.get("knowledge_cards", []):
+                if not isinstance(card, dict):
+                    continue
+                content = card.get("content", "")
+                if not content or len(content.strip()) < 5:
+                    continue
+                knowledge_cards.append({
+                    "id": card.get("id", f"{group_id}_card_{len(knowledge_cards)+1}"),
+                    "content": content.strip(),
+                    "is_learned": False
+                })
+
+            quiz_questions = []
+            for q in group.get("quiz_questions", []):
+                if not isinstance(q, dict):
+                    continue
+                question_text = q.get("question", "")
+                options = q.get("options", [])
+                if not question_text or len(question_text.strip()) < 5:
+                    continue
+                if not isinstance(options, list) or len(options) < 2:
+                    continue
+
+                correct_answer = q.get("correct_answer", 0)
+                if not isinstance(correct_answer, int) or correct_answer < 0 or correct_answer >= len(options):
+                    correct_answer = 0
+
+                quiz_questions.append({
+                    "id": q.get("id", f"{group_id}_quiz_{len(quiz_questions)+1}"),
+                    "question": question_text.strip(),
+                    "options": options,
+                    "correct_answer": correct_answer,
+                    "explanation": q.get("explanation", "").strip(),
+                    "difficulty": q.get("difficulty", "medium") if q.get("difficulty") in ["easy", "medium", "hard"] else "medium",
+                    "is_completed": False
+                })
+
+            if knowledge_cards or quiz_questions:
+                validated_groups.append({
+                    "id": group_id,
+                    "title": title.strip(),
+                    "description": description.strip() if description else "",
+                    "knowledge_cards": knowledge_cards,
+                    "quiz_questions": quiz_questions
+                })
+
+        return validated_groups
+
     def _generate_fallback_data(self, session_id: str, message_count: int) -> Dict[str, Any]:
-        """Generate fallback data when LLM generation fails"""
-        logger.warning(f"Generating fallback structured review data for session {session_id}")
+        """Return empty data when LLM generation fails — no placeholder content."""
+        logger.warning(f"LLM generation failed for session {session_id}, returning empty review data")
 
         now = datetime.utcnow()
         next_review = now + timedelta(days=1)
@@ -321,45 +605,11 @@ class StructuredReviewGenerator:
             "session_id": session_id,
             "message_count": message_count,
             "generated_at": now.isoformat(),
-            "aggregated_summary": f"基于{message_count}条对话消息的总结（生成失败时回退数据）",
-            "review_groups": [
-                {
-                    "id": "general_knowledge",
-                    "title": "通用知识",
-                    "description": "对话中的核心知识点总结",
-                    "knowledge_cards": [
-                        {
-                            "id": "fallback_card_1",
-                            "content": "请回顾对话中的主要讨论内容",
-                            "is_learned": False
-                        },
-                        {
-                            "id": "fallback_card_2",
-                            "content": "注意理解对话中的关键概念",
-                            "is_learned": False
-                        }
-                    ],
-                    "quiz_questions": [
-                        {
-                            "id": "fallback_quiz_1",
-                            "question": "对话主要讨论了什么内容？",
-                            "options": [
-                                "技术相关话题",
-                                "生活日常",
-                                "娱乐休闲",
-                                "工作学习"
-                            ],
-                            "correct_answer": 0,
-                            "explanation": "对话内容以技术讨论为主",
-                            "difficulty": "easy",
-                            "is_completed": False
-                        }
-                    ]
-                }
-            ],
-            "total_groups": 1,
-            "total_knowledge_cards": 2,
-            "total_quiz_questions": 1,
+            "aggregated_summary": f"复习数据生成失败（会话 {session_id}），请稍后重试",
+            "review_groups": [],
+            "total_groups": 0,
+            "total_knowledge_cards": 0,
+            "total_quiz_questions": 0,
             "next_review_date": next_review.isoformat()
         }
 

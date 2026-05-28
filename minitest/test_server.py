@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent / "agent"))
 
 import uvicorn
 from backend.main import app

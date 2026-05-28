@@ -336,6 +336,22 @@ async def execute_review_generation(
             logger.error(f"Failed to generate structured review: {e}")
             raise
 
+        # 2.5. Audit generated content against source conversation (dual-phase verification)
+        try:
+            logger.info(f"Starting audit phase for session {session_id}")
+            structured_data = await asyncio.to_thread(
+                structured_review_generator.audit_review,
+                structured_data,
+                message_list,
+                api_key=api_key,
+                base_url=base_url,
+                model=model
+            )
+            logger.info(f"Audit phase completed for session {session_id}")
+        except Exception as e:
+            logger.error(f"Audit phase failed for session {session_id}: {e}, using unverified data")
+            # Continue with unverified data rather than failing entirely
+
         # 3. Prepare data for storage
         review_groups = structured_data.get("review_groups", [])
         aggregated_summary = structured_data.get("aggregated_summary", "")
@@ -350,7 +366,8 @@ async def execute_review_generation(
             "base_url": base_url,
             "model": model,
             "message_count": len(message_list),
-            "generated_at": datetime.utcnow().isoformat()
+            "generated_at": datetime.utcnow().isoformat(),
+            "audit_summary": structured_data.get("audit_summary", "")
         }
 
         # 5. Store results in database
@@ -402,41 +419,15 @@ async def scan_and_generate_reviews():
 
         logger.info(f"Selected {len(session_ids)} sessions for review generation")
 
-        # Create tasks for each session
-        tasks_created = 0
-        for session_id in session_ids:
-            try:
-                # Create a background task for each session
-                # Note: In production, you might want to use a task queue
-                task = crud.create_review_generation_task(
-                    db=db,
-                    session_id=session_id,
-                    task_type="scheduled",
-                    priority=5  # Medium priority for scheduled tasks
-                )
-
-                # Update review data status
-                crud.update_review_generation_status(
-                    db=db,
-                    session_id=session_id,
-                    status="generating"
-                )
-
-                tasks_created += 1
-                logger.debug(f"Created task for session {session_id}")
-
-            except Exception as e:
-                logger.error(f"Error creating task for session {session_id}: {e}")
-
-        logger.info(f"Created {tasks_created} review generation tasks")
-
-        # In a real implementation, you would now execute these tasks
-        # For simplicity, we'll schedule them for immediate execution
-        # but in production you might use a worker pool
+        # Process sessions sequentially in a single batch job to avoid
+        # resource contention (N concurrent LLM calls + DB writes).
+        if session_ids:
+            from backend.scheduler.task_executor import schedule_batch_review_generation
+            job_id = schedule_batch_review_generation(session_ids, config={})
+            logger.info(f"Scheduled batch review generation job {job_id} for {len(session_ids)} sessions")
 
         return {
             "sessions_selected": len(session_ids),
-            "tasks_created": tasks_created,
             "timestamp": datetime.utcnow().isoformat()
         }
 

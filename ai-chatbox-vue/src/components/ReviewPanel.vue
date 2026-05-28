@@ -28,13 +28,99 @@
           <p class="character-greeting">{{ characterGreeting }}</p>
         </div>
       </div>
-      <CharacterSelector />
+      <div class="header-actions">
+        <button class="import-note-btn" @click="showImportDialog = true" title="从笔记导入复习内容">
+          <svg class="import-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="12" y1="18" x2="12" y2="12"/>
+            <polyline points="9 15 12 12 15 15"/>
+          </svg>
+        </button>
+        <CharacterSelector />
+      </div>
     </div>
 
 
 
-    <!-- Review Groups -->
-    <div class="review-groups">
+    <!-- Review Groups — nested session accordion when session_groups available -->
+    <div v-if="reviewData?.session_groups && reviewData.session_groups.length > 0" class="review-groups">
+      <template v-for="sg in reviewData.session_groups" :key="sg.session_id">
+        <!-- Single-group session: render group directly, no wrapper -->
+        <template v-if="sg.group_count === 1">
+          <div v-for="group in sg.groups" :key="group.id" class="review-group">
+            <div class="group-header" @click="toggleGroupExpansion(group.id)">
+              <div class="group-icon">
+                <span class="group-icon-circle"></span>
+              </div>
+              <div class="group-info">
+                <h4 class="group-title">{{ group.title }}</h4>
+                <div class="group-meta">
+                  <span class="meta-item">{{ (group.knowledge_cards?.length || 0) + (group.quiz_questions?.length || 0) }}个复习项目</span>
+                  <span class="meta-item">{{ getGroupProgress(group) }}% 完成</span>
+                </div>
+              </div>
+              <div class="group-expand">
+                <span :class="['expand-icon', { 'expanded': expandedGroups.includes(group.id) }]">›</span>
+              </div>
+              <button class="delete-btn" :disabled="deletingSession === sg.session_id" @click.stop="handleDeleteSession(sg.session_id)" title="删除该会话复习">
+                <span v-if="deletingSession === sg.session_id" class="delete-spinner"></span>
+                <span v-else class="delete-icon">×</span>
+              </button>
+            </div>
+            <div v-if="expandedGroups.includes(group.id)" class="group-items">
+              <ReviewGroupContent :group="group" @toggle-card="toggleCardLearned" @select-answer="selectAnswer" />
+            </div>
+          </div>
+        </template>
+
+        <!-- Multi-group session: session wrapper with nested groups -->
+        <div v-else class="session-wrapper">
+          <div class="session-header" @click="toggleSessionExpansion(sg.session_id)">
+            <div class="session-header-left">
+              <span :class="['session-expand-icon', { 'expanded': expandedSessions.includes(sg.session_id) }]">›</span>
+              <div class="session-title-group">
+                <h4 class="session-title">{{ sg.title }}</h4>
+                <span class="session-meta">{{ sg.group_count }}个题组</span>
+              </div>
+            </div>
+            <button class="delete-btn" :disabled="deletingSession === sg.session_id" @click.stop="handleDeleteSession(sg.session_id)" title="删除该会话全部复习">
+              <span v-if="deletingSession === sg.session_id" class="delete-spinner"></span>
+              <span v-else class="delete-icon">×</span>
+            </button>
+          </div>
+          <div v-if="expandedSessions.includes(sg.session_id)" class="session-groups">
+            <div v-for="group in sg.groups" :key="group.id" class="review-group nested">
+              <div class="group-header" @click="toggleGroupExpansion(group.id)">
+                <div class="group-icon">
+                  <span class="group-icon-circle small"></span>
+                </div>
+                <div class="group-info">
+                  <h4 class="group-title">{{ group.title }}</h4>
+                  <div class="group-meta">
+                    <span class="meta-item">{{ (group.knowledge_cards?.length || 0) + (group.quiz_questions?.length || 0) }}个复习项目</span>
+                    <span class="meta-item">{{ getGroupProgress(group) }}% 完成</span>
+                  </div>
+                </div>
+                <div class="group-expand">
+                  <span :class="['expand-icon', { 'expanded': expandedGroups.includes(group.id) }]">›</span>
+                </div>
+                <button class="delete-btn small" :disabled="deletingGroup === group.id" @click.stop="handleDeleteGroup(sg.session_id, group.id)" title="删除该题组">
+                  <span v-if="deletingGroup === group.id" class="delete-spinner"></span>
+                  <span v-else class="delete-icon">×</span>
+                </button>
+              </div>
+              <div v-if="expandedGroups.includes(group.id)" class="group-items">
+                <ReviewGroupContent :group="group" @toggle-card="toggleCardLearned" @select-answer="selectAnswer" />
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- Fallback: flat review_groups when no session_groups -->
+    <div v-else class="review-groups">
       <div v-for="group in (reviewData?.review_groups || [])" :key="group.id" class="review-group">
         <div class="group-header" @click="toggleGroupExpansion(group.id)">
           <div class="group-icon">
@@ -53,100 +139,7 @@
         </div>
 
         <div v-if="expandedGroups.includes(group.id)" class="group-items">
-          <!-- Knowledge Cards Section -->
-          <div v-if="group.knowledge_cards && group.knowledge_cards.length > 0" class="section-container">
-            <div class="section-header">
-              <h5 class="section-title">知识卡片</h5>
-              <span class="section-count">{{ group.knowledge_cards.length }}个知识点</span>
-            </div>
-            <div class="knowledge-cards">
-              <div v-for="card in group.knowledge_cards" :key="card.id" class="knowledge-card">
-                <div class="card-header">
-                  <label class="card-checkbox-label" :title="card.is_learned ? '标记为未学' : '标记为已学'">
-                    <input
-                      type="checkbox"
-                      class="card-checkbox"
-                      :checked="card.is_learned"
-                      @change="toggleCardLearned(group.id, card.id, !card.is_learned)"
-                    />
-                    <span class="checkbox-custom"></span>
-                  </label>
-                  <div class="card-content">
-                    <p>{{ card.content }}</p>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- Quiz Questions Section -->
-          <div v-if="group.quiz_questions && group.quiz_questions.length > 0" class="section-container">
-            <div class="section-header">
-              <h5 class="section-title">选择题</h5>
-              <span class="section-count">{{ group.quiz_questions.length }}道题</span>
-            </div>
-            <div class="quiz-questions">
-              <div v-for="question in group.quiz_questions" :key="question.id" class="quiz-question">
-                <div class="question-header">
-                  <span class="question-icon">Q</span>
-                  <div class="question-content">
-                    <h6>{{ question.question }}</h6>
-
-                    <!-- Options display -->
-                    <div v-if="question.is_completed" class="completed-question">
-                      <div class="options-display">
-                        <div v-for="(option, index) in question.options" :key="index"
-                             :class="['option-item', {
-                               'correct': index === question.correct_answer,
-                               'incorrect': question.user_answer !== undefined && index === question.user_answer && !question.is_correct
-                             }]">
-                          <span class="option-label">{{ ['A', 'B', 'C', 'D'][index] }}.</span>
-                          <span class="option-text">{{ option }}</span>
-                          <span v-if="index === question.correct_answer" class="correct-mark">正确</span>
-                          <span v-if="question.user_answer !== undefined && index === question.user_answer && !question.is_correct" class="incorrect-mark">错误</span>
-                        </div>
-                      </div>
-                      <div class="explanation">
-                        <strong>解析：</strong>{{ question.explanation }}
-                      </div>
-                    </div>
-
-                    <!-- Options selection (if not completed) -->
-                    <div v-else class="options-selection">
-                      <div v-for="(option, index) in question.options" :key="index"
-                           class="option-item selectable"
-                           @click="selectAnswer(group.id, question.id, index)">
-                        <span class="option-label">{{ ['A', 'B', 'C', 'D'][index] }}.</span>
-                        <span class="option-text">{{ option }}</span>
-                      </div>
-                    </div>
-
-                    <div class="question-meta">
-                      <span class="difficulty-badge" :class="question.difficulty">{{
-                        question.difficulty === 'easy' ? '简单' :
-                        question.difficulty === 'medium' ? '中等' : '困难'
-                      }}</span>
-                      <span v-if="question.is_completed" class="completion-status">
-                        {{ question.is_correct ? '回答正确' : '回答错误' }}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- Group statistics -->
-          <div class="group-statistics">
-            <div class="stat-item">
-              <span class="stat-label">相关会话数:</span>
-              <span class="stat-value">{{ group.session_count }}</span>
-            </div>
-            <div class="stat-item">
-              <span class="stat-label">出现频率:</span>
-              <span class="stat-value">{{ group.frequency }}次</span>
-            </div>
-          </div>
+          <ReviewGroupContent :group="group" @toggle-card="toggleCardLearned" @select-answer="selectAnswer" />
         </div>
       </div>
     </div>
@@ -183,6 +176,64 @@
       </button>
     </div>
 
+    <!-- Confirm Delete Dialog -->
+    <div v-if="confirmDialog.show" class="import-overlay" @click.self="closeConfirm">
+      <div class="import-dialog confirm-dialog">
+        <div class="import-dialog-header">
+          <h4>{{ confirmDialog.title }}</h4>
+        </div>
+        <p class="confirm-message">{{ confirmDialog.message }}</p>
+        <div class="import-dialog-footer">
+          <button @click="closeConfirm" class="dialog-btn cancel">取消</button>
+          <button @click="executeConfirm" class="dialog-btn danger">确认删除</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Import Notes Dialog -->
+    <div v-if="showImportDialog" class="import-overlay" @click.self="showImportDialog = false">
+      <div class="import-dialog">
+        <div class="import-dialog-header">
+          <h4>导入笔记</h4>
+          <p class="import-dialog-desc">从 Markdown 学习笔记生成复习卡片和题目</p>
+        </div>
+        <div class="import-mode-tabs">
+          <button
+            :class="['mode-tab', { active: importMode === 'file' }]"
+            @click="importMode = 'file'"
+          >单个文件</button>
+          <button
+            :class="['mode-tab', { active: importMode === 'directory' }]"
+            @click="importMode = 'directory'"
+          >目录</button>
+        </div>
+        <div class="import-path-input">
+          <input
+            v-model="importPath"
+            type="text"
+            :placeholder="importMode === 'file' ? 'Markdown 文件路径，如 D:\\notes\\topic.md' : '目录路径，如 D:\\Desktop\\vllm\\learn-vllm'"
+            @keydown.enter="importNotes"
+          />
+        </div>
+        <div v-if="importResults" class="import-results">
+          <div v-for="r in importResults" :key="r.note_id" class="import-result-item">
+            <span :class="['result-dot', r.status]"></span>
+            <span class="result-name">{{ r.note_id }}</span>
+            <span v-if="r.status === 'completed'" class="result-stats">
+              {{ r.total_groups }}组 · {{ r.total_knowledge_cards }}卡片 · {{ r.total_quiz_questions }}题
+            </span>
+            <span v-else class="result-error">{{ r.error || 'failed' }}</span>
+          </div>
+        </div>
+        <div class="import-dialog-footer">
+          <button @click="showImportDialog = false" class="dialog-btn cancel">取消</button>
+          <button @click="importNotes" class="dialog-btn confirm" :disabled="importingNotes || !importPath.trim()">
+            {{ importingNotes ? '导入中...' : '导入' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- Character Standee - draggable -->
     <div
       v-if="currentCharacter.avatar"
@@ -209,6 +260,8 @@ import { useConfigStore } from '@/stores/configStore'
 import { useReviewStore } from '@/stores/reviewStore'
 import { fetchIntegratedReviewProgress, saveIntegratedReviewProgress } from '@/api'
 import CharacterSelector from './CharacterSelector.vue'
+import { generateNotesReview } from '@/api'
+import ReviewGroupContent from './ReviewGroupContent.vue'
 
 // Debug logging helper with module tag
 const DEBUG = true // Set to true for debugging review module
@@ -229,19 +282,25 @@ const configStore = useConfigStore()
 const reviewStore = useReviewStore()
 const currentCharacter = computed(() => chatStore.currentCharacter)
 
-// API data state - new structured review format
+// API data state
 const reviewData = ref<IntegratedReviewData | null>(null)
 const isLoading = ref(false)
 const isRegenerating = ref(false)
-const isPolling = ref(false)
-const pollIntervalId = ref<NodeJS.Timeout | null>(null)
-const pollAttempts = ref(0)
-const MAX_POLL_ATTEMPTS = 60 // 最多轮询60次，每次3秒，总共3分钟
-const POLL_INTERVAL = 3000 // 3秒轮询间隔
-const reviewDays = ref(7) // 复习时间范围（天）
+const reviewDays = ref(7)
 const error = ref('')
-const customGreeting = ref('') // 临时自定义问候语
-const expandedGroups = ref<string[]>([]) // 展开的组ID数组
+const customGreeting = ref('')
+const expandedGroups = ref<string[]>([])
+const pollTimer = ref<ReturnType<typeof setInterval> | null>(null)
+const generationInProgress = ref(false)
+const batchProgress = ref<{ total: number; completed: number } | null>(null)
+const expandedSessions = ref<string[]>([])
+
+// Notes import dialog
+const showImportDialog = ref(false)
+const importMode = ref<'file' | 'directory'>('file')
+const importPath = ref('')
+const importingNotes = ref(false)
+const importResults = ref<any[] | null>(null)
 
 // Draggable standee logic - using left/top positioning to avoid drift
 const standeeRef = ref<HTMLElement | null>(null)
@@ -335,7 +394,7 @@ const stopDrag = () => {
   document.removeEventListener('touchend', stopDrag)
 }
 
-// Fetch integrated review data (not dependent on current session)
+// Fetch integrated review data
 const fetchReviewData = async (forceRefresh = false) => {
   isLoading.value = true
   error.value = ''
@@ -343,81 +402,48 @@ const fetchReviewData = async (forceRefresh = false) => {
   try {
     debugLog('fetch', 'Loading integrated review data...', { forceRefresh })
 
-    // Get API configuration from config store
     const { apiKey, baseUrl, model } = configStore.apiConfig
     debugLog('fetch', '使用API配置:', { baseUrl, model, hasApiKey: !!apiKey })
 
-    // Call store method to load integrated review data
     const result = await reviewStore.loadIntegratedReview(10, reviewDays.value, forceRefresh, apiKey, baseUrl, model)
     debugLog('fetch', 'Integrated review result received:', result)
 
-    // Check the result status
-    if (result.status === 'regenerating') {
-      // Review regeneration started
-      debugLog('fetch', 'Review regeneration started:', result.taskInfo)
+    const data = result.data
+    reviewData.value = data
+    error.value = ''
 
-      // Show regeneration message
-      error.value = '复习内容正在重新生成中，请稍后刷新...'
+    // Track generation progress for polling
+    generationInProgress.value = result.generation_in_progress || false
+    batchProgress.value = result.batch_progress || null
 
-      // Schedule automatic refresh after 10 seconds
-      setTimeout(() => {
-        debugLog('fetch', 'Auto-refreshing after regeneration delay')
-        fetchReviewData(false) // Refresh without force
-      }, 10000)
-    } else if (result.status === 'completed') {
-      // Normal response with integrated review data
-      const data = result.data
-      debugLog('fetch', 'Integrated review data:', data)
-
-      // Store the integrated review data
-      reviewData.value = data
-      error.value = ''
-
-      // Load saved progress and apply to the data
-      try {
-        const progressData = await fetchIntegratedReviewProgress(reviewDays.value)
-        debugLog('fetch', 'Progress data from server:', progressData)
-        if (progressData) {
-          const learnedCards = progressData.learned_cards || []
-          const completedQuizzes = progressData.completed_quizzes || []
-          const totalCards = data.review_groups?.reduce((sum, g) => sum + (g.knowledge_cards?.length || 0), 0) || 0
-          const totalQuestions = data.review_groups?.reduce((sum, g) => sum + (g.quiz_questions?.length || 0), 0) || 0
-          debugLog('fetch', 'Applying progress:', { learnedCards, completedQuizzes, totalCards, totalQuestions })
-          applyProgress(data, learnedCards, completedQuizzes)
-          const card1 = data.review_groups?.[0]?.knowledge_cards?.find(c => c.id === 'card_1')
-          debugLog('fetch', 'After applyProgress, card_1 is_learned:', card1?.is_learned)
-        } else {
-          debugWarn('fetch', 'progressData is falsy')
-        }
-      } catch (progressErr) {
-        debugWarn('fetch', 'Failed to load progress:', progressErr)
-      }
+    // Poll while batch is running to pick up incremental results
+    if (generationInProgress.value) {
+      startPolling()
     } else {
-      throw new Error(`Unexpected result status: ${result.status}`)
+      stopPolling()
+    }
+
+    // Load saved progress and apply to the data
+    try {
+      const progressData = await fetchIntegratedReviewProgress(reviewDays.value)
+      if (progressData) {
+        const learnedCards = progressData.learned_cards || []
+        const completedQuizzes = progressData.completed_quizzes || []
+        applyProgress(data, learnedCards, completedQuizzes)
+      }
+    } catch (progressErr) {
+      debugWarn('fetch', 'Failed to load progress:', progressErr)
     }
   } catch (err: any) {
-    // Error handling for integrated review
     const errorObj = err.originalError || err
     let errorMessage = '获取整合复习数据失败'
     let errorDetails = ''
 
-    debugWarn('fetch', 'Error details:', {
-      message: err.message,
-      originalError: err.originalError ? 'present' : 'absent',
-      response: errorObj.response ? `status: ${errorObj.response.status}` : 'none',
-      request: errorObj.request ? 'present' : 'none',
-      code: errorObj.code,
-      isAxiosError: errorObj.isAxiosError
-    })
-
     if (errorObj.response) {
-      // Server responded with error status
       const status = errorObj.response.status
       const data = errorObj.response.data || {}
       errorMessage = `服务器错误 (${status})`
       errorDetails = data.detail || data.message || JSON.stringify(data)
-      debugWarn('fetch', `Server error ${status}:`, errorDetails)
-
       if (status === 500) {
         errorMessage = '服务器内部错误，请检查后端日志'
       } else if (status === 404) {
@@ -428,25 +454,38 @@ const fetchReviewData = async (forceRefresh = false) => {
         errorMessage = '请求错误，请检查参数'
       }
     } else if (errorObj.request) {
-      // Request made but no response
       errorMessage = '网络错误：服务器无响应'
-      errorDetails = '请检查后端服务器是否运行 (uv run python -m backend.main)'
-      debugWarn('fetch', 'Network error, no response:', errorObj.request)
-
+      errorDetails = '请检查后端服务器是否运行'
       if (errorObj.code === 'ECONNABORTED' || err.message?.includes('timeout')) {
-        errorMessage = '请求超时 (30秒)'
-        errorDetails = '后端处理过慢或LLM调用失败。检查：1) 后端日志 2) API配置是否正确 3) Ollama服务是否运行'
+        errorMessage = '请求超时'
+        errorDetails = '后端处理过慢或LLM调用失败'
       }
     } else {
-      // Something else happened
       errorMessage = err.message || '未知错误'
-      errorDetails = errorObj.toString()
-      debugWarn('fetch', 'Other error:', errorObj)
     }
 
     error.value = `${errorMessage}${errorDetails ? `: ${errorDetails}` : ''}`
+    debugWarn('fetch', 'Error:', errorMessage, errorDetails)
   } finally {
     isLoading.value = false
+  }
+}
+
+// Poll while batch generation is running to pick up incremental results
+const startPolling = () => {
+  if (pollTimer.value) return  // already polling
+  debugLog('poll', 'Starting poll for incremental review results')
+  pollTimer.value = setInterval(() => {
+    debugLog('poll', 'Polling for updated review data...')
+    fetchReviewData(false)
+  }, 5000)
+}
+
+const stopPolling = () => {
+  if (pollTimer.value) {
+    debugLog('poll', 'Stopping poll')
+    clearInterval(pollTimer.value)
+    pollTimer.value = null
   }
 }
 
@@ -486,9 +525,18 @@ interface SessionInfo {
   message_count?: number
 }
 
+interface SessionGroup {
+  session_id: string
+  title: string
+  generated_at?: string
+  groups: ReviewGroup[]
+  group_count: number
+}
+
 interface IntegratedReviewData {
   aggregated_summary: string
   review_groups: ReviewGroup[]
+  session_groups: SessionGroup[]
   next_review_date: string
   session_count: number
   total_groups: number
@@ -617,6 +665,15 @@ const toggleGroupExpansion = (groupId: string) => {
   debugLog('groups', '更新后状态:', expandedGroups.value)
 }
 
+const toggleSessionExpansion = (sessionId: string) => {
+  const index = expandedSessions.value.indexOf(sessionId)
+  if (index > -1) {
+    expandedSessions.value.splice(index, 1)
+  } else {
+    expandedSessions.value.push(sessionId)
+  }
+}
+
 const startReview = (item: ReviewItem) => {
   debugLog('review', '开始复习:', item.title)
   // TODO: 实现复习逻辑
@@ -626,6 +683,63 @@ const startReview = (item: ReviewItem) => {
 
 const refreshReview = () => {
   fetchReviewData(false)
+}
+
+const deletingSession = ref<string | null>(null)
+const deletingGroup = ref<string | null>(null)
+
+// Confirm dialog state
+const confirmDialog = ref<{
+  show: boolean
+  title: string
+  message: string
+  onConfirm: () => void
+}>({ show: false, title: '', message: '', onConfirm: () => {} })
+
+const showConfirm = (title: string, message: string, onConfirm: () => void) => {
+  confirmDialog.value = { show: true, title, message, onConfirm }
+}
+
+const closeConfirm = () => {
+  confirmDialog.value = { show: false, title: '', message: '', onConfirm: () => {} }
+}
+
+const executeConfirm = () => {
+  const cb = confirmDialog.value.onConfirm
+  closeConfirm()
+  cb()
+}
+
+const handleDeleteSession = (sessionId: string) => {
+  showConfirm('删除会话复习', '将删除该会话的全部复习题组和卡片，此操作不可撤销。', async () => {
+    try {
+      deletingSession.value = sessionId
+      await reviewStore.removeSessionReview(sessionId)
+      if (reviewStore.integratedReview.session_groups.length === 0) {
+        reviewStore.clearIntegratedReview()
+      }
+    } catch (err: any) {
+      debugWarn('delete', '删除会话复习失败:', err)
+    } finally {
+      deletingSession.value = null
+    }
+  })
+}
+
+const handleDeleteGroup = (sessionId: string, groupId: string) => {
+  showConfirm('删除题组', '将删除该题组及其包含的所有卡片和题目，此操作不可撤销。', async () => {
+    try {
+      deletingGroup.value = groupId
+      await reviewStore.removeReviewGroup(sessionId, groupId)
+      if (reviewStore.integratedReview.session_groups.length === 0) {
+        reviewStore.clearIntegratedReview()
+      }
+    } catch (err: any) {
+      debugWarn('delete', '删除题组失败:', err)
+    } finally {
+      deletingGroup.value = null
+    }
+  })
 }
 
 const refreshOnAvatarClick = () => {
@@ -658,6 +772,13 @@ const regenerateOnAvatarDoubleClick = () => {
     return
   }
 
+  if (generationInProgress.value) {
+    debugLog('avatar', '后台正在生成复习内容，忽略双击触发')
+    customGreeting.value = '学姐正在帮你整理复习内容呢，稍等一下...'
+    setTimeout(() => { customGreeting.value = '' }, 3000)
+    return
+  }
+
   debugLog('avatar', '双击头像触发重新生成复习内容')
 
   // 设置自定义问候语（樱岛麻衣口吻）
@@ -683,182 +804,147 @@ const regenerateOnAvatarDoubleClick = () => {
 const regenerateReview = async () => {
   if (isRegenerating.value) return
 
+  // Skip if a background batch is already running
+  if (generationInProgress.value) {
+    debugLog('regenerate', '后台正在生成复习内容，忽略主动触发')
+    return
+  }
+
   debugLog('regenerate', '触发整合复习重新生成')
   isRegenerating.value = true
   error.value = ''
+  stopPolling()
 
   try {
-    // Get API configuration from config store
     const { apiKey, baseUrl, model } = configStore.apiConfig
     debugLog('regenerate', '使用API配置:', { baseUrl, model, hasApiKey: !!apiKey })
 
-    const result = await reviewStore.regenerateIntegratedReview(10, reviewDays.value, apiKey, baseUrl, model)
+    // Trigger regeneration (backend fires-and-forgets, returns existing data immediately)
+    await reviewStore.regenerateIntegratedReview(10, reviewDays.value, apiKey, baseUrl, model)
 
-    if (result.status === 'regenerating') {
-      // 重新生成已触发，显示消息
-      debugLog('regenerate', '重新生成已触发:', result.taskInfo)
-
-      // 显示重新生成中的状态
-      // 不设置 error，保持现有界面内容可见
-
-      // 启动轮询，等待生成完成
-      startPollingForReviewData()
-
-    } else if (result.status === 'completed') {
-      // 直接返回了数据（不太可能发生）
-      debugLog('regenerate', '重新生成完成，数据已更新')
-      reviewData.value = result.data
-      isRegenerating.value = false
-    }
+    // Refresh display data after a short delay to pick up any newly generated content
+    setTimeout(() => {
+      fetchReviewData(false)
+    }, 5000)
   } catch (err: any) {
     debugWarn('regenerate', '重新生成失败:', err)
     error.value = `重新生成失败: ${err.message}`
+  } finally {
     isRegenerating.value = false
   }
 }
 
-const startPollingForReviewData = () => {
-  if (isPolling.value) {
-    debugLog('polling', '轮询已在进行中')
-    return
+const importNotes = async () => {
+  if (!importPath.value.trim()) return
+
+  importingNotes.value = true
+  importResults.value = null
+
+  try {
+    const { apiKey, baseUrl, model } = configStore.apiConfig
+    const results = await generateNotesReview({
+      mode: importMode.value,
+      path: importPath.value.trim(),
+      api_key: apiKey,
+      base_url: baseUrl,
+      model,
+    })
+    importResults.value = results
+    showImportDialog.value = false
+
+    // Refresh review data to show newly imported content
+    setTimeout(() => fetchReviewData(false), 1000)
+  } catch (err: any) {
+    debugWarn('notes', 'Import failed:', err)
+    importResults.value = [{ status: 'failed', note_id: 'error', error: err.message }]
+  } finally {
+    importingNotes.value = false
+  }
+}
+
+// Lifecycle
+onMounted(() => {
+  // 初始化人物位置
+  if (position.value.x === 0 && position.value.y === 0) {
+    position.value = {
+      x: window.innerWidth - 340,
+      y: window.innerHeight - 620
+    }
   }
 
-  debugLog('polling', '开始轮询复习数据')
-  isPolling.value = true
-  pollAttempts.value = 0
+  fetchReviewData(false)
+})
 
-  pollIntervalId.value = setInterval(async () => {
-    pollAttempts.value++
+onUnmounted(() => {
+  stopDrag()
+  stopPolling()
+})
 
-    if (pollAttempts.value >= MAX_POLL_ATTEMPTS) {
-      // 轮询超时
-      debugWarn('polling', `轮询超时，已达最大尝试次数: ${MAX_POLL_ATTEMPTS}`)
-      stopPolling()
-      error.value = '复习内容生成超时，请稍后手动刷新'
-      isRegenerating.value = false
-      return
-    }
-
-    debugLog('polling', `轮询尝试 ${pollAttempts.value}/${MAX_POLL_ATTEMPTS}`)
-
-    try {
-      // 获取API配置
-      const { apiKey, baseUrl, model } = configStore.apiConfig
-
-      // 调用store方法检查数据
-      const result = await reviewStore.loadIntegratedReview(10, reviewDays.value, false, apiKey, baseUrl, model)
-
-
-      if (result.status === 'completed') {
-        const data = result.data
-        debugLog('polling', '获取到复习数据:', data)
-
-        // 检查是否有实际数据（不仅仅是占位符）
-        const hasActualData = data.aggregated_summary !== 'No review data available.' &&
-          data.review_groups?.length > 0
-
-        if (hasActualData) {
-          // 有实际数据，停止轮询
-          debugLog('polling', '检测到实际数据，停止轮询')
-          reviewData.value = data
-          error.value = ''
-
-          // Load saved progress
-          try {
-            const progressData = await fetchIntegratedReviewProgress(reviewDays.value)
-            debugLog('polling', 'Progress data from server:', progressData)
-            if (progressData) {
-              applyProgress(data, progressData.learned_cards || [], progressData.completed_quizzes || [])
-            }
-          } catch (progressErr) {
-            debugWarn('polling', 'Failed to load progress:', progressErr)
-          }
-
-          stopPolling()
-          isRegenerating.value = false
-        } else {
-          debugLog('polling', '无实际数据，继续轮询')
-        }
-      } else if (result.status === 'regenerating') {
-        // 仍在生成中，继续轮询
-        debugLog('polling', '仍在生成中，继续轮询')
-      } else {
-        debugWarn('polling', '意外的响应状态:', result.status)
-      }
-    } catch (err: any) {
-      debugWarn('polling', '轮询时出错:', err)
-      // 继续轮询，不停止
-    }
-  }, POLL_INTERVAL)
-}
-
-const stopPolling = () => {
-  if (pollIntervalId.value) {
-    clearInterval(pollIntervalId.value)
-    pollIntervalId.value = null
-  }
-  isPolling.value = false
-  debugLog('polling', '轮询已停止')
-}
-
-const generateReview = () => {
-  debugLog('review', '智能生成复习内容')
-  // TODO: 调用API生成复习内容
-}
-
-const exportReview = () => {
-  debugLog('review', '导出复习笔记')
-  // TODO: 实现导出功能
-}
-
-// Apply saved progress to review data
+// Apply saved progress to review data (both merged groups and session_groups)
 const applyProgress = (data: IntegratedReviewData, learnedCards: string[], completedQuizzes: string[]) => {
-  if (!data?.review_groups) return
-
-  for (const group of data.review_groups) {
-    // Apply learned card status (qualified ID: "groupId:cardId")
-    if (group.knowledge_cards) {
-      for (const card of group.knowledge_cards) {
-        if (learnedCards.includes(card.id) || learnedCards.includes(`${group.id}:${card.id}`)) {
-          card.is_learned = true
+  const applyToGroups = (groups: ReviewGroup[]) => {
+    for (const group of groups) {
+      if (group.knowledge_cards) {
+        for (const card of group.knowledge_cards) {
+          if (learnedCards.includes(card.id) || learnedCards.includes(`${group.id}:${card.id}`)) {
+            card.is_learned = true
+          }
+        }
+      }
+      if (group.quiz_questions) {
+        for (const question of group.quiz_questions) {
+          if (completedQuizzes.includes(question.id) || completedQuizzes.includes(`${group.id}:${question.id}`)) {
+            question.is_completed = true
+          }
         }
       }
     }
+  }
 
-    // Apply completed quiz status (qualified ID: "groupId:questionId")
-    if (group.quiz_questions) {
-      for (const question of group.quiz_questions) {
-        if (completedQuizzes.includes(question.id) || completedQuizzes.includes(`${group.id}:${question.id}`)) {
-          question.is_completed = true
-        }
-      }
+  if (data?.review_groups) {
+    applyToGroups(data.review_groups)
+  }
+  if (data?.session_groups) {
+    for (const sg of data.session_groups) {
+      applyToGroups(sg.groups)
     }
   }
 }
 
 // Save current progress to server
 const saveProgress = async () => {
-  if (!reviewData.value?.review_groups) return
-
   const learnedCards: string[] = []
   const completedQuizzes: string[] = []
 
-  for (const group of reviewData.value.review_groups) {
-    if (group.knowledge_cards) {
-      for (const card of group.knowledge_cards) {
-        if (card.is_learned) {
-          learnedCards.push(`${group.id}:${card.id}`) // qualified ID to avoid cross-group collisions
+  const collectFromGroups = (groups: ReviewGroup[]) => {
+    for (const group of groups) {
+      if (group.knowledge_cards) {
+        for (const card of group.knowledge_cards) {
+          if (card.is_learned) {
+            learnedCards.push(`${group.id}:${card.id}`)
+          }
         }
       }
-    }
-    if (group.quiz_questions) {
-      for (const question of group.quiz_questions) {
-        if (question.is_completed) {
-          completedQuizzes.push(`${group.id}:${question.id}`)
+      if (group.quiz_questions) {
+        for (const question of group.quiz_questions) {
+          if (question.is_completed) {
+            completedQuizzes.push(`${group.id}:${question.id}`)
+          }
         }
       }
     }
   }
+
+  if (reviewData.value?.review_groups) {
+    collectFromGroups(reviewData.value.review_groups)
+  }
+  if (reviewData.value?.session_groups) {
+    for (const sg of reviewData.value.session_groups) {
+      collectFromGroups(sg.groups)
+    }
+  }
+
+  if (learnedCards.length === 0 && completedQuizzes.length === 0) return
 
   try {
     await saveIntegratedReviewProgress(reviewDays.value, learnedCards, completedQuizzes)
@@ -874,14 +960,26 @@ const toggleCardLearned = (groupId: string, cardId: string, isLearned: boolean) 
 
   if (!reviewData.value) return
 
-  // Find the card in the specified group only
-  const group = reviewData.value.review_groups.find(g => g.id === groupId)
-  if (!group?.knowledge_cards) return
-  const card = group.knowledge_cards.find(c => c.id === cardId)
-  if (!card) return
+  // Search in review_groups and session_groups
+  const findAndUpdate = (groups: ReviewGroup[]) => {
+    const group = groups.find(g => g.id === groupId)
+    if (!group?.knowledge_cards) return false
+    const card = group.knowledge_cards.find(c => c.id === cardId)
+    if (card) {
+      card.is_learned = isLearned
+      return true
+    }
+    return false
+  }
 
-  card.is_learned = isLearned
-  saveProgress()
+  let found = findAndUpdate(reviewData.value.review_groups)
+  if (!found && reviewData.value.session_groups) {
+    for (const sg of reviewData.value.session_groups) {
+      if (findAndUpdate(sg.groups)) { found = true; break }
+    }
+  }
+
+  if (found) saveProgress()
 }
 
 // Handle quiz question answer selection
@@ -890,39 +988,29 @@ const selectAnswer = (groupId: string, questionId: string, answerIndex: number) 
 
   if (!reviewData.value) return
 
-  // Find the question in the specified group only
-  const group = reviewData.value.review_groups.find(g => g.id === groupId)
-  if (!group?.quiz_questions) return
-  const question = group.quiz_questions.find(q => q.id === questionId)
-  if (!question) return
+  const findAndUpdate = (groups: ReviewGroup[]) => {
+    const group = groups.find(g => g.id === groupId)
+    if (!group?.quiz_questions) return false
+    const question = group.quiz_questions.find(q => q.id === questionId)
+    if (question) {
+      question.is_completed = true
+      question.user_answer = answerIndex
+      question.is_correct = answerIndex === question.correct_answer
+      return true
+    }
+    return false
+  }
 
-  // Mark as completed and check correctness
-  question.is_completed = true
-  question.user_answer = answerIndex
-  question.is_correct = answerIndex === question.correct_answer
-
-  // Save progress to server
-  saveProgress()
-}
-
-// Lifecycle
-onMounted(() => {
-  // 初始化人物位置
-  if (position.value.x === 0 && position.value.y === 0) {
-    position.value = {
-      x: window.innerWidth - 340,
-      y: window.innerHeight - 620
+  let found = findAndUpdate(reviewData.value.review_groups)
+  if (!found && reviewData.value.session_groups) {
+    for (const sg of reviewData.value.session_groups) {
+      if (findAndUpdate(sg.groups)) { found = true; break }
     }
   }
 
-  // 初始获取整合复习数据（不依赖当前session）
-  fetchReviewData(false)
-})
+  if (found) saveProgress()
+}
 
-onUnmounted(() => {
-  stopDrag()
-  stopPolling()
-})
 </script>
 
 <style scoped>
@@ -1433,6 +1521,99 @@ onUnmounted(() => {
 
 .expand-icon.expanded {
   transform: rotate(90deg);
+}
+
+/* Session wrapper for nested accordion */
+.session-wrapper {
+  background: rgba(255, 255, 255, 0.95);
+  border-radius: 12px;
+  border: 1px solid rgba(156, 137, 184, 0.3);
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+
+.session-wrapper:hover {
+  border-color: rgba(156, 137, 184, 0.5);
+  box-shadow: 0 4px 12px rgba(156, 137, 184, 0.1);
+}
+
+.session-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  background: rgba(156, 137, 184, 0.06);
+  cursor: pointer;
+  transition: background 0.2s ease;
+  user-select: none;
+}
+
+.session-header:hover {
+  background: rgba(156, 137, 184, 0.12);
+}
+
+.session-header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.session-expand-icon {
+  display: inline-block;
+  font-size: 1.4rem;
+  color: #9C89B8;
+  transition: transform 0.3s ease;
+  transform: rotate(0deg);
+  flex-shrink: 0;
+}
+
+.session-expand-icon.expanded {
+  transform: rotate(90deg);
+}
+
+.session-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.session-title {
+  margin: 0;
+  color: #6a5a8d;
+  font-size: 1rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-meta {
+  font-size: 0.8rem;
+  color: #888;
+}
+
+.session-groups {
+  padding: 8px 12px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Nested group inside session wrapper */
+.review-group.nested {
+  border-color: rgba(156, 137, 184, 0.15);
+  margin-left: 0;
+}
+
+.review-group.nested .group-header {
+  padding: 12px 16px;
+}
+
+.group-icon-circle.small {
+  width: 18px;
+  height: 18px;
 }
 
 .group-items {
@@ -2287,4 +2468,293 @@ onUnmounted(() => {
     }
   }
 }
+
+/* Header actions group */
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Import note button in header */
+.import-note-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  background: rgba(156, 137, 184, 0.08);
+  border: 1px solid rgba(156, 137, 184, 0.2);
+  border-radius: 8px;
+  color: #9c89b8;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.import-note-btn:hover {
+  background: rgba(156, 137, 184, 0.15);
+  border-color: rgba(156, 137, 184, 0.35);
+  color: #7c6aa0;
+}
+
+.import-note-btn .import-icon {
+  flex-shrink: 0;
+}
+
+/* Import dialog overlay */
+.import-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(74, 74, 109, 0.2);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.import-dialog {
+  background: #fff;
+  border-radius: 16px;
+  padding: 28px;
+  width: 460px;
+  max-width: 90vw;
+  box-shadow: 0 16px 48px rgba(156, 137, 184, 0.2);
+  color: #4a4a6d;
+}
+
+.import-dialog-header {
+  margin-bottom: 20px;
+}
+
+.import-dialog-header h4 {
+  margin: 0 0 4px;
+  font-size: 18px;
+  font-weight: 600;
+  color: #4a4a6d;
+}
+
+.import-dialog-desc {
+  margin: 0;
+  font-size: 13px;
+  color: #8e8ea0;
+}
+
+/* Mode tabs */
+.import-mode-tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 16px;
+  background: #f5f0fa;
+  border-radius: 10px;
+  padding: 3px;
+}
+
+.mode-tab {
+  flex: 1;
+  padding: 8px 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: #8e8ea0;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.mode-tab.active {
+  background: #fff;
+  color: #4a4a6d;
+  box-shadow: 0 1px 3px rgba(156, 137, 184, 0.15);
+}
+
+/* Path input */
+.import-path-input {
+  margin-bottom: 16px;
+}
+
+.import-path-input input {
+  width: 100%;
+  padding: 10px 14px;
+  background: #faf8ff;
+  border: 1px solid #e0d8f0;
+  border-radius: 10px;
+  color: #4a4a6d;
+  font-size: 13px;
+  box-sizing: border-box;
+  transition: border-color 0.2s;
+}
+
+.import-path-input input:focus {
+  outline: none;
+  border-color: #9c89b8;
+}
+
+.import-path-input input::placeholder {
+  color: #c0b8d0;
+}
+
+/* Footer */
+.import-dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.dialog-btn {
+  padding: 8px 20px;
+  border-radius: 10px;
+  border: none;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.dialog-btn.cancel {
+  background: #f5f0fa;
+  color: #8e8ea0;
+}
+
+.dialog-btn.cancel:hover {
+  background: #ebe4f5;
+  color: #4a4a6d;
+}
+
+.dialog-btn.confirm {
+  background: linear-gradient(135deg, #9c89b8, #b8a0d8);
+  color: #fff;
+}
+
+.dialog-btn.confirm:hover {
+  background: linear-gradient(135deg, #8b78a7, #a78fc7);
+}
+
+.dialog-btn.confirm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.dialog-btn.danger {
+  background: linear-gradient(135deg, #e06060, #d04848);
+  color: #fff;
+}
+
+.dialog-btn.danger:hover {
+  background: linear-gradient(135deg, #c85050, #b84040);
+}
+
+/* Confirm dialog */
+.confirm-dialog {
+  width: 380px;
+}
+
+.confirm-message {
+  margin: 0 0 24px 0;
+  font-size: 14px;
+  color: #6a6a80;
+  line-height: 1.6;
+}
+
+/* Results list */
+.import-results {
+  margin-bottom: 16px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.import-result-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 0;
+  font-size: 13px;
+  border-bottom: 1px solid #f0ecf5;
+}
+
+.import-result-item:last-child {
+  border-bottom: none;
+}
+
+.result-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.result-dot.completed {
+  background: #7bc89c;
+}
+
+.result-dot.failed {
+  background: #e09090;
+}
+
+.result-stats {
+  color: #b0a8c0;
+  font-size: 12px;
+  margin-left: auto;
+}
+
+.result-error {
+  color: #d08080;
+  font-size: 12px;
+  margin-left: auto;
+}
+
+/* Delete buttons for session and group */
+.delete-btn {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: #b0a0c0;
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0;
+  margin-left: 8px;
+}
+
+.delete-btn:hover {
+  background: rgba(244, 67, 54, 0.1);
+  color: #e06060;
+}
+
+.delete-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.delete-btn.small {
+  width: 24px;
+  height: 24px;
+  font-size: 16px;
+}
+
+.delete-icon {
+  line-height: 1;
+}
+
+.delete-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(224, 96, 96, 0.2);
+  border-top-color: #e06060;
+  border-radius: 50%;
+  animation: delete-spin 0.6s linear infinite;
+}
+
+@keyframes delete-spin {
+  to { transform: rotate(360deg); }
+}
+
 </style>

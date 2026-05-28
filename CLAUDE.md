@@ -96,7 +96,17 @@ docs/
 
 ## 开发命令
 
+### 一键启动 / 停止
+```bash
+# 一键启动前后端（后台运行，日志写入 logs/ 目录）
+python start.py
+
+# 停止所有服务
+python stop.py
+```
+
 ### 后端开发
+
 ```bash
 cd agent
 # 运行FastAPI服务器（热重载）
@@ -133,10 +143,10 @@ npm run type-check
 ```bash
 # 清空SQLite数据库
 cd agent
-uv run python -m backend.minitest.clear_sqlite
+uv run python ../minitest/clear_sqlite.py
 
 # 清空Neo4j知识图谱
-uv run python -m backend.minitest.clear_neo4j
+uv run python ../minitest/clear_neo4j.py
 
 # 通过Docker本地运行Neo4j
 docker run -d --name neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password neo4j:latest
@@ -148,13 +158,13 @@ docker run -d --name neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/passwor
 ```bash
 # 测试API服务器
 cd agent
-uv run python -m backend.minitest.test_server
+uv run python ../minitest/test_server.py
 
 # 检查Neo4j连接
-uv run python -m backend.minitest.test_neo4j
+uv run python ../minitest/test_neo4j.py
 
 # 检查会话数据
-uv run python -m backend.minitest.check_session
+uv run python ../minitest/check_session.py
 ```
 
 ## 环境配置

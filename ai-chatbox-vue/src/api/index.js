@@ -224,49 +224,24 @@ export const fetchIntegratedReview = async (limit = 10, days = 7, forceRefresh =
       api_key,
       base_url,
       model
-    }, { timeout: 15000 }); // 15 seconds timeout for integrated review
+    }, { timeout: 15000 });
 
-    // Note: apiClient interceptors return response.data, not the full response object.
-    // So `response` here is actually the data from the server.
-    // The server returns either:
-    // 1. For 200 OK: IntegratedReviewResponse data (with aggregated_summary, etc.)
-    // 2. For 202 Accepted: {message, regenerating_sessions, task_ids, ...}
-
-    // Check if this is a 202 Accepted response (regeneration triggered)
-    if (response.message && (response.regenerating_sessions || response.sessions_triggered || response.status === 'generating')) {
-      // This is a 202 response (regeneration started)
-      return {
-        status: 'regenerating',
-        taskInfo: response,
-        message: response.message || 'Review regeneration started'
-      };
-    } else if (response.aggregated_summary !== undefined) {
-      // This is a 200 response with integrated review data
-      return {
-        status: 'completed',
-        data: response,
-        message: 'Integrated review data loaded'
-      };
-    } else {
-      // Unexpected response format
-      console.warn('Unexpected integrated review response format:', response);
-      throw new Error(`Unexpected response format from integrated review endpoint`);
-    }
+    // Backend always returns 200 with integrated review data.
+    // Background regeneration is fire-and-forget — the frontend
+    // always gets existing data (or empty) immediately.
+    // generation_in_progress signals that a background batch is running;
+    // the frontend should poll to pick up incremental results.
+    return {
+      status: 'completed',
+      data: response,
+      generation_in_progress: response.generation_in_progress || false,
+      batch_progress: response.batch_progress || null,
+      message: 'Integrated review data loaded'
+    };
   } catch (error) {
-    // Handle axios error structure
     if (error.response) {
       const status = error.response.status;
       const data = error.response.data;
-
-      if (status === 202) {
-        // Actually got 202 but axios treated it as error (shouldn't happen with proper config)
-        return {
-          status: 'regenerating',
-          taskInfo: data,
-          message: 'Review regeneration started'
-        };
-      }
-
       throw new Error(data.detail || `API error: ${status}`);
     }
     throw error;
@@ -275,6 +250,26 @@ export const fetchIntegratedReview = async (limit = 10, days = 7, forceRefresh =
 
 export const getSessionsWithReviews = async () => {
   return apiClient.get('/review/integrated/sessions', { timeout: 5000 });
+};
+
+// Review deletion API
+export const deleteSessionReview = async (sessionId) => {
+  return apiClient.delete(`/review/${sessionId}`);
+};
+
+export const deleteReviewGroup = async (sessionId, groupId) => {
+  return apiClient.delete(`/review/${sessionId}/groups/${groupId}`);
+};
+
+// Notes review API
+export const generateNotesReview = async ({ mode, path, api_key, base_url, model }) => {
+  return apiClient.post('/notes/review', {
+    mode,
+    path,
+    api_key,
+    base_url,
+    model
+  }, { timeout: 120000 }); // 120 seconds for LLM generation
 };
 
 // Model API

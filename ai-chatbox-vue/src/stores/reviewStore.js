@@ -7,7 +7,9 @@ import {
   fetchReviewQuestions,
   markReviewCompleted,
   fetchIntegratedReview,
-  getSessionsWithReviews
+  getSessionsWithReviews,
+  deleteSessionReview,
+  deleteReviewGroup
 } from '@/api'
 
 export const useReviewStore = defineStore('review', () => {
@@ -402,6 +404,7 @@ export const useReviewStore = defineStore('review', () => {
         integratedReview.value = {
           aggregated_summary: data.aggregated_summary || '',
           review_groups: data.review_groups || [],
+          session_groups: data.session_groups || [],
           next_review_date: data.next_review_date || null,
           session_count: data.session_count || 0,
           total_groups: data.total_groups || 0,
@@ -413,7 +416,9 @@ export const useReviewStore = defineStore('review', () => {
         isIntegratedLoading.value = false
         return {
           status: 'completed',
-          data: integratedReview.value
+          data: integratedReview.value,
+          generation_in_progress: result.generation_in_progress || false,
+          batch_progress: result.batch_progress || null
         }
       } else {
         throw new Error(`Unexpected response status: ${result.status}`)
@@ -426,6 +431,7 @@ export const useReviewStore = defineStore('review', () => {
       integratedReview.value = {
         aggregated_summary: 'Error loading integrated review.',
         review_groups: [],
+        session_groups: [],
         next_review_date: null,
         session_count: 0,
         total_groups: 0,
@@ -449,15 +455,16 @@ export const useReviewStore = defineStore('review', () => {
 
       if (result.status === 'regenerating') {
         // Regeneration started, we could start polling here
-        // For now, just return the task info
         isIntegratedLoading.value = false
         return {
           status: 'regenerating',
           taskInfo: result.taskInfo,
-          message: result.message
+          message: result.message,
+          generation_in_progress: true,
+          batch_progress: null
         }
       } else if (result.status === 'completed') {
-        // This shouldn't happen with forceRefresh=true, but handle it anyway
+        // Backend returns data immediately, with generation_in_progress flag
         const data = result.data
         integratedReview.value = {
           aggregated_summary: data.aggregated_summary || '',
@@ -472,7 +479,9 @@ export const useReviewStore = defineStore('review', () => {
         isIntegratedLoading.value = false
         return {
           status: 'completed',
-          data: integratedReview.value
+          data: integratedReview.value,
+          generation_in_progress: result.generation_in_progress || false,
+          batch_progress: result.batch_progress || null
         }
       } else {
         throw new Error(`Unexpected response status: ${result.status}`)
@@ -501,6 +510,7 @@ export const useReviewStore = defineStore('review', () => {
     integratedReview.value = {
       aggregated_summary: '',
       review_groups: [],
+      session_groups: [],
       next_review_date: null,
       session_count: 0,
       total_groups: 0,
@@ -509,6 +519,53 @@ export const useReviewStore = defineStore('review', () => {
       sessions: []
     }
     sessionsWithReviews.value = []
+  }
+
+  const removeSessionReview = async (sessionId) => {
+    try {
+      await deleteSessionReview(sessionId)
+    } catch (err) {
+      // 404 is fine — the data may only exist in integrated cache
+      if (err.response?.status !== 404) {
+        console.error('Error deleting session review:', err)
+        error.value = `Failed to delete session review: ${err.message}`
+        throw err
+      }
+    }
+    // Remove from local state regardless
+    const groups = integratedReview.value.session_groups || []
+    integratedReview.value.session_groups = groups.filter(sg => sg.session_id !== sessionId)
+    if (integratedReview.value.review_groups) {
+      integratedReview.value.review_groups = integratedReview.value.review_groups.filter(
+        g => g.session_ids && !g.session_ids.includes(sessionId)
+      )
+    }
+    return true
+  }
+
+  const removeReviewGroup = async (sessionId, groupId) => {
+    try {
+      await deleteReviewGroup(sessionId, groupId)
+    } catch (err) {
+      if (err.response?.status !== 404) {
+        console.error('Error deleting review group:', err)
+        error.value = `Failed to delete review group: ${err.message}`
+        throw err
+      }
+    }
+    // Remove from local state regardless
+    const sessionGroups = integratedReview.value.session_groups || []
+    for (const sg of sessionGroups) {
+      if (sg.session_id === sessionId && sg.groups) {
+        sg.groups = sg.groups.filter(g => g.id !== groupId)
+        sg.group_count = sg.groups.length
+        if (sg.group_count === 0) {
+          integratedReview.value.session_groups = sessionGroups.filter(s => s.session_id !== sessionId)
+        }
+        break
+      }
+    }
+    return true
   }
 
   return {
@@ -551,6 +608,8 @@ export const useReviewStore = defineStore('review', () => {
     loadIntegratedReview,
     regenerateIntegratedReview,
     loadSessionsWithReviews,
-    clearIntegratedReview
+    clearIntegratedReview,
+    removeSessionReview,
+    removeReviewGroup
   }
 })

@@ -189,6 +189,135 @@ def schedule_retry_task(session_id: str, delay_minutes: int = 5):
     return job_id
 
 
+# Batch review generation — processes sessions sequentially to avoid resource contention
+# Module-level tracking to prevent duplicate batches and support incremental display
+_active_batches: Dict[str, dict] = {}  # key -> {session_ids, completed_sessions, started_at, config}
+
+
+def is_batch_active(batch_key: str) -> bool:
+    """Check if a batch is currently running for the given key."""
+    if batch_key not in _active_batches:
+        return False
+    # Clean up stale entries (crashed jobs, orphaned tracking)
+    started = _active_batches[batch_key].get("started_at")
+    if started and (datetime.utcnow() - started).total_seconds() > 1800:  # 30 min timeout
+        logger.warning(f"Removing stale batch entry for '{batch_key}' (started {started})")
+        del _active_batches[batch_key]
+        return False
+    return True
+
+
+def get_batch_progress(batch_key: str) -> dict:
+    """Get progress of an active batch. Returns empty dict if no batch active."""
+    batch = _active_batches.get(batch_key)
+    if not batch:
+        return {}
+    return {
+        "total": len(batch["session_ids"]),
+        "completed": len(batch["completed_sessions"]),
+        "session_ids": batch["session_ids"],
+        "completed_sessions": batch["completed_sessions"],
+        "started_at": batch["started_at"].isoformat()
+    }
+
+
+def execute_batch_review_generation_task(session_ids: list, config: Dict[str, Any] = None, batch_key: str = None):
+    """
+    Process multiple sessions sequentially in a single APScheduler job.
+
+    Avoids the resource contention (DB locks + LLM API calls) that occurs
+    when N individual jobs run concurrently via schedule_review_generation().
+
+    Updates _active_batches tracking as each session completes, enabling
+    incremental display of results before the full batch finishes.
+    """
+    import asyncio
+
+    if config is None:
+        config = {}
+
+    logger.info(f"Starting batch review generation for {len(session_ids)} sessions (key={batch_key})")
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        completed = 0
+        failed = 0
+        for i, session_id in enumerate(session_ids):
+            logger.info(f"Batch [{i+1}/{len(session_ids)}] processing session {session_id}")
+            try:
+                loop.run_until_complete(generate_review_background(session_id, config))
+                completed += 1
+                # Mark as completed in tracker so review endpoint can see it immediately
+                if batch_key and batch_key in _active_batches:
+                    _active_batches[batch_key]["completed_sessions"].append(session_id)
+            except Exception as e:
+                logger.error(f"Batch [{i+1}/{len(session_ids)}] failed for {session_id}: {e}")
+                failed += 1
+
+        logger.info(f"Batch review generation completed: {completed} ok, {failed} failed")
+        return {"completed": completed, "failed": failed}
+    finally:
+        if 'loop' in locals():
+            loop.close()
+        # Clean up tracking
+        if batch_key and batch_key in _active_batches:
+            del _active_batches[batch_key]
+
+
+def schedule_batch_review_generation(session_ids: list, config: Dict[str, Any] = None,
+                                     batch_key: str = None):
+    """
+    Schedule a single batched job that processes sessions sequentially.
+
+    If batch_key is provided and a batch with the same key is already active,
+    returns None instead of creating a duplicate.
+    """
+    from .config import scheduler
+
+    if config is None:
+        config = {}
+
+    # Deduplicate: if a batch with this key is already running, don't create another
+    if batch_key and is_batch_active(batch_key):
+        logger.info(f"Batch '{batch_key}' already active, skipping duplicate")
+        return None
+
+    # Filter out sessions that are already in an active batch
+    active_session_ids = set()
+    for key, batch in _active_batches.items():
+        active_session_ids.update(batch["session_ids"])
+    filtered_ids = [sid for sid in session_ids if sid not in active_session_ids]
+    if not filtered_ids:
+        logger.info("All candidate sessions are already being processed, skipping")
+        return None
+
+    # Register tracking entry
+    if batch_key:
+        _active_batches[batch_key] = {
+            "session_ids": filtered_ids,
+            "completed_sessions": [],
+            "started_at": datetime.utcnow(),
+            "config": config
+        }
+
+    job_id = f"review_batch_{len(filtered_ids)}_{int(datetime.utcnow().timestamp())}"
+
+    job = scheduler.add_job(
+        execute_batch_review_generation_task,
+        'date',
+        run_date=datetime.utcnow(),
+        args=[filtered_ids, config, batch_key],
+        id=job_id,
+        misfire_grace_time=600,
+        coalesce=True
+    )
+
+    logger.info(f"Scheduled batch review generation job {job_id} for {len(filtered_ids)} sessions (key={batch_key})")
+    return job_id
+
+
 # Integrated review task functions
 
 def execute_integrated_review_generation_task(days: int, config: Dict[str, Any] = None):

@@ -29,6 +29,7 @@ Importance scale (1-5):
 - 1 (peripheral): Edge mentions/tangential references.
 
 IMPORTANT: Follow the distribution percentages above. Not all entities should be importance 4 or 5.
+IMPORTANT: Extract at most 10 entities total. Focus only on the most important ones. Omit trivial mentions and peripheral concepts (importance 1-2 should be rare). If the conversation doesn't contain enough distinct entities, return fewer — quality over quantity.
 
 Entity types to identify:
 - concept: Abstract concepts, theories, ideas (e.g., "machine learning", "neural network")
@@ -189,6 +190,22 @@ class KnowledgeExtractor:
             # Validate structure
             entities = result.get("entities", [])
             relationships = result.get("relationships", [])
+
+            # Cap entities to top 10 by importance to keep the graph clean
+            original_entity_count = len(entities)
+            original_rel_count = len(relationships)
+            if len(entities) > 10:
+                entities.sort(key=lambda e: e.get("importance", 1), reverse=True)
+                kept = entities[:10]
+                kept_names = {e.get("name", "") for e in kept}
+                entities = kept
+                # Only keep relationships where both endpoints are in the kept entities
+                relationships = [
+                    r for r in relationships
+                    if r.get("source", "") in kept_names and r.get("target", "") in kept_names
+                ]
+                logger.info(f"Capped entities from {original_entity_count} to {len(entities)}, "
+                           f"filtered {original_rel_count} relationships to {len(relationships)}")
 
             logger.info(f"Extracted {len(entities)} entities and {len(relationships)} relationships")
             if entities:

@@ -5,9 +5,10 @@ import sys
 import os
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-# Add the project root to the path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add the agent directory to the path
+sys.path.insert(0, str(Path(__file__).parent.parent / "agent"))
 
 from backend.database.session import SessionLocal, init_db
 from backend.database import crud

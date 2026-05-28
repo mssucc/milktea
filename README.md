@@ -161,9 +161,9 @@ docker run -d --name neo4j -p 7474:7474 -p 7687:7687 \
 
 ```bash
 cd agent
-uv run python -m backend.minitest.clear_sqlite     # 清空 SQLite
-uv run python -m backend.minitest.clear_neo4j       # 清空 Neo4j
-uv run python -m backend.minitest.clear_review_data # 仅清空复习数据
+uv run python ../minitest/clear_sqlite.py       # 清空 SQLite
+uv run python ../minitest/clear_neo4j.py        # 清空 Neo4j
+uv run python ../minitest/clear_review_data.py   # 仅清空复习数据
 ```
 
 所有清理命令在删除前都会要求确认。

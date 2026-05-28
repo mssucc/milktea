@@ -1,0 +1,13 @@
+{
+  "enabledPlugins": {
+    "vue-skills-bundle@vue-skills": true,
+    "create-adaptable-composable@vue-skills": true,
+    "vue-testing-best-practices@vue-skills": true,
+    "vue-router-best-practices@vue-skills": true,
+    "vue-pinia-best-practices@vue-skills": true,
+    "vue-options-api-best-practices@vue-skills": true,
+    "vue-jsx-best-practices@vue-skills": true,
+    "vue-best-practices@vue-skills": true,
+    "vue-debug-guides@vue-skills": true
+  }
+}

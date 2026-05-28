@@ -10,7 +10,11 @@ from .task_executor import (
     schedule_startup_catchup_scan,
     schedule_retry_task,
     execute_integrated_review_generation_task,
-    schedule_integrated_review_generation
+    schedule_integrated_review_generation,
+    execute_batch_review_generation_task,
+    schedule_batch_review_generation,
+    is_batch_active,
+    get_batch_progress
 )
 
 __all__ = [
@@ -25,5 +29,9 @@ __all__ = [
     'schedule_startup_catchup_scan',
     'schedule_retry_task',
     'execute_integrated_review_generation_task',
-    'schedule_integrated_review_generation'
+    'schedule_integrated_review_generation',
+    'execute_batch_review_generation_task',
+    'schedule_batch_review_generation',
+    'is_batch_active',
+    'get_batch_progress'
 ]

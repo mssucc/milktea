@@ -12,9 +12,10 @@ from fastapi.responses import JSONResponse
 from backend.database.session import get_db
 from backend.database import crud
 from backend.database.model import ReviewData
-from backend.scheduler import schedule_review_generation, schedule_integrated_review_generation
+from backend.scheduler import schedule_review_generation, schedule_integrated_review_generation, schedule_batch_review_generation, is_batch_active, get_batch_progress
 from backend.utils.structured_review_generator import structured_review_generator
 from backend.utils.node_based_review_generator import node_based_review_generator
+from backend.graph_db.graph_generator import graph_generator
 
 logger = logging.getLogger(__name__)
 
@@ -193,19 +194,24 @@ async def get_session_review(
         # 2. Check if review is currently being generated
         review_data = crud.get_review_data(db, session_id)
         if review_data and review_data.generation_status == "generating":
-            logger.info(f"Review generation in progress for session {session_id}")
-            # Return 202 Accepted with task information
-            return JSONResponse(
-                status_code=202,
-                content={
-                    "message": "Review generation in progress",
-                    "session_id": session_id,
-                    "status": "generating",
-                    "estimated_time": 120,  # Estimated time in seconds
-                    "poll_url": f"/api/review/{session_id}/status",
-                    "generated_at": review_data.generated_at.isoformat() if review_data.generated_at else None
-                }
-            )
+            # Treat as stale if last_attempt_at is missing or older than 10 minutes
+            stale_cutoff = datetime.utcnow() - timedelta(minutes=10)
+            if (review_data.last_attempt_at is None
+                    or review_data.last_attempt_at < stale_cutoff):
+                logger.info(f"Stale generating status for session {session_id}, triggering fresh generation")
+            else:
+                logger.info(f"Review generation in progress for session {session_id}")
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "message": "Review generation in progress",
+                        "session_id": session_id,
+                        "status": "generating",
+                        "estimated_time": 120,
+                        "poll_url": f"/api/review/{session_id}/status",
+                        "generated_at": review_data.generated_at.isoformat() if review_data.generated_at else None
+                    }
+                )
 
         # 3. Check if session exists (has messages)
         messages = crud.get_messages_by_session(db, session_id, limit=1)
@@ -487,6 +493,52 @@ async def mark_card_learned(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+# Session-level and group-level deletion
+
+@router.delete("/review/{session_id}")
+async def delete_session_review(session_id: str, db: Session = Depends(get_db)):
+    """Delete all review data for a session (including note-based reviews).
+
+    Falls back to removing the session from integrated cache if the per-session
+    record no longer exists (e.g. expired and cleaned up).
+    """
+    try:
+        deleted = crud.delete_review_data(db, session_id)
+        # Also remove this session from all integrated caches
+        cache_cleaned = crud.remove_session_from_integrated_caches(db, session_id)
+        if not deleted and not cache_cleaned:
+            raise HTTPException(status_code=404, detail=f"No review data found for session '{session_id}'")
+        logger.info(f"Deleted review data for session {session_id} (per-session: {deleted}, cache: {cache_cleaned})")
+        return {"message": f"Review data deleted for session '{session_id}'", "session_id": session_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting review for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.delete("/review/{session_id}/groups/{group_id}")
+async def delete_review_group_endpoint(session_id: str, group_id: str, db: Session = Depends(get_db)):
+    """Delete a specific review group from a session's review data.
+
+    Falls back to removing the group from integrated cache if the per-session
+    record no longer exists.
+    """
+    try:
+        deleted = crud.delete_review_group(db, session_id, group_id)
+        # Also try to remove this group from integrated caches
+        cache_cleaned = crud.remove_group_from_integrated_caches(db, session_id, group_id)
+        if not deleted and not cache_cleaned:
+            raise HTTPException(status_code=404, detail=f"Group '{group_id}' not found in session '{session_id}'")
+        logger.info(f"Deleted group {group_id} from session {session_id} (per-session: {deleted}, cache: {cache_cleaned})")
+        return {"message": f"Group '{group_id}' deleted from session '{session_id}'", "session_id": session_id, "group_id": group_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting group {group_id} from session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 # Integrated review endpoints (cross-session aggregation)
 
 class IntegratedReviewRequest(BaseModel):
@@ -521,16 +573,99 @@ class IntegratedReviewGroup(ReviewGroup):
     session_count: int = Field(description="Number of sessions contributing to this group")
 
 
+class SessionGroup(BaseModel):
+    """Groups from a single session for nested accordion display"""
+    session_id: str
+    title: str
+    generated_at: Optional[str] = None
+    groups: List[ReviewGroup]
+    group_count: int
+
+
 class IntegratedReviewResponse(BaseModel):
     """Response model for integrated review data"""
     aggregated_summary: str
     review_groups: List[IntegratedReviewGroup]
+    session_groups: List[SessionGroup] = []
     next_review_date: str
     session_count: int
     total_groups: int
     total_knowledge_cards: int
     total_quiz_questions: int
     sessions: List[SessionInfo]
+    generation_in_progress: bool = False
+    batch_progress: Optional[dict] = None
+
+
+def _enrich_session_titles_with_kg(session_groups: list) -> None:
+    """Replace session_groups wrapper titles with top knowledge graph entity names.
+
+    Falls back to existing titles if Neo4j is unavailable or returns no entities.
+    """
+    if not session_groups:
+        return
+    try:
+        session_ids = [sg["session_id"] for sg in session_groups if sg.get("session_id")]
+        if not session_ids:
+            return
+
+        entities = graph_generator.get_entities_for_sessions(session_ids)
+        if not entities:
+            return
+
+        # Find the highest importance entity per session
+        best_per_session: Dict[str, tuple] = {}
+        for e in entities:
+            e_name = e.get("name", "")
+            e_session_ids = e.get("session_ids", [])
+            e_scores = e.get("importance_scores", [])
+            if not e_name:
+                continue
+            for sid in session_ids:
+                if sid in e_session_ids:
+                    idx = e_session_ids.index(sid)
+                    score = e_scores[idx] if idx < len(e_scores) else e.get("importance_score", 1)
+                    current = best_per_session.get(sid)
+                    if not current or score > current[1]:
+                        best_per_session[sid] = (e_name, score)
+
+        for sg in session_groups:
+            best = best_per_session.get(sg["session_id"])
+            if best:
+                sg["title"] = best[0]
+    except Exception:
+        # Neo4j unavailable — keep existing titles as fallback
+        pass
+
+
+def _format_cached_integrated(cached) -> dict:
+    """Format a cached integrated ReviewData record into a response dict."""
+    review_groups = cached.review_groups or []
+    session_groups = []
+    sessions = []
+    if cached.generation_config and isinstance(cached.generation_config, dict):
+        entity_count = cached.generation_config.get("entity_count", 0)
+        session_groups = cached.generation_config.get("session_groups", [])
+        for i in range(min(3, max(1, entity_count // 5))):
+            sessions.append({
+                "session_id": f"cached_session_{i+1}",
+                "generated_at": cached.generated_at.isoformat() if cached.generated_at else None,
+                "recency_weight": 0.3,
+                "message_count": 8
+            })
+    return {
+        "aggregated_summary": cached.aggregated_summary or "",
+        "review_groups": review_groups,
+        "session_groups": session_groups,
+        "next_review_date": cached.next_review_date.isoformat() if cached.next_review_date else datetime.now(timezone.utc).isoformat(),
+        "session_count": len(sessions),
+        "total_groups": len(review_groups),
+        "total_knowledge_cards": sum(len(g.get("knowledge_cards", [])) for g in review_groups),
+        "total_quiz_questions": sum(len(g.get("quiz_questions", [])) for g in review_groups),
+        "sessions": sessions,
+        "generation_in_progress": False,
+        "batch_progress": None
+    }
 
 
 def empty_integrated_review(days: int = 7) -> dict:
@@ -538,12 +673,15 @@ def empty_integrated_review(days: int = 7) -> dict:
     return {
         "aggregated_summary": f"基于最近{days}天对话的复习数据",
         "review_groups": [],
+        "session_groups": [],
         "next_review_date": datetime.now(timezone.utc).isoformat(),
         "session_count": 0,
         "total_groups": 0,
         "total_knowledge_cards": 0,
         "total_quiz_questions": 0,
-        "sessions": []
+        "sessions": [],
+        "generation_in_progress": False,
+        "batch_progress": None
     }
 
 
@@ -567,176 +705,147 @@ async def get_integrated_review_overview(
     logger.info(f"Integrated review overview requested: days={request.days}, limit={request.limit}, force_refresh={request.force_refresh}")
 
     try:
-        # Check cache first (unless force refresh)
-        if not request.force_refresh:
-            cached_review = crud.get_valid_integrated_review_data(db, request.days)
-            if cached_review:
-                logger.info(f"Cache hit for integrated review ({request.days} days), returning cached data")
+        now = datetime.utcnow()
+        stale_incomplete_cutoff = now - timedelta(days=30)  # incomplete + 30 days → stale
+        stale_completed_cutoff = now - timedelta(days=7)    # completed + 7 days → stale
 
-                # Convert cached ReviewData to IntegratedReviewResponse format
-                sessions = []
-                # For integrated reviews, we don't have real session info
-                # Create simulated session info based on generation config
-                if cached_review.generation_config and isinstance(cached_review.generation_config, dict):
-                    entity_count = cached_review.generation_config.get("entity_count", 0)
-                    for i in range(min(3, max(1, entity_count // 5))):
-                        sessions.append({
-                            "session_id": f"cached_session_{i+1}",
-                            "generated_at": cached_review.generated_at.isoformat() if cached_review.generated_at else None,
-                            "recency_weight": 0.3,
-                            "message_count": 8
-                        })
+        # ── 1. Check cached integrated review ──────────────────────────
+        cached_integrated = db.query(ReviewData).filter(
+            ReviewData.generation_type == "integrated",
+            ReviewData.time_range_days == request.days
+        ).first()
 
-                return {
-                    "aggregated_summary": cached_review.aggregated_summary or "",
-                    "review_groups": cached_review.review_groups or [],
-                    "next_review_date": cached_review.next_review_date.isoformat() if cached_review.next_review_date else datetime.now(timezone.utc).isoformat(),
-                    "session_count": len(sessions),
-                    "total_groups": len(cached_review.review_groups or []),
-                    "total_knowledge_cards": sum(len(g.get("knowledge_cards", [])) for g in (cached_review.review_groups or [])),
-                    "total_quiz_questions": sum(len(g.get("quiz_questions", [])) for g in (cached_review.review_groups or [])),
-                    "sessions": sessions
-                }
+        # ── 2. Staleness: clear review groups if too old ───────────────
+        if cached_integrated and cached_integrated.review_groups and cached_integrated.generated_at:
+            status = cached_integrated.generation_status
+            if status in ("generating", "failed", "pending"):
+                if cached_integrated.generated_at < stale_incomplete_cutoff:
+                    logger.info(f"Clearing stale incomplete integrated review ({request.days}d, status={status})")
+                    cached_integrated.review_groups = []
+                    db.commit()
+            elif status == "completed":
+                if cached_integrated.generated_at < stale_completed_cutoff:
+                    logger.info(f"Clearing stale completed integrated review ({request.days}d)")
+                    cached_integrated.review_groups = []
+                    db.commit()
 
-        logger.info(f"No cache found or force refresh requested for {request.days} days integrated review")
+        # ── 3. Determine what to display ───────────────────────────────
+        display_data = None
+        batch_key = f"integrated_{request.days}d"
+        generation_in_progress = is_batch_active(batch_key)
 
-        # Check time range
-        if request.days <= 7:
-            if not request.force_refresh:
-                # 0-7 days: try aggregating existing session reviews first
-                aggregated_data = crud.get_aggregated_review_data(
-                    db=db,
-                    session_ids=request.session_ids,
-                    limit=request.limit,
-                    days=request.days
-                )
+        # Use cached integrated data if it has review groups and is not being force-refreshed
+        has_valid_cache = (
+            not request.force_refresh
+            and cached_integrated
+            and cached_integrated.review_groups
+            and len(cached_integrated.review_groups) > 0
+        )
+        if has_valid_cache:
+            logger.info(f"Returning cached integrated review ({request.days}d)")
+            display_data = _format_cached_integrated(cached_integrated)
 
-                if aggregated_data.get("total_groups", 0) > 0:
-                    logger.info(f"7-day integrated review data available: {aggregated_data['total_groups']} groups")
-
-                    # Create/ensure integrated ReviewData record for progress tracking
+        # Fall back to aggregating per-session review data
+        if display_data is None and not request.force_refresh and request.days <= 7:
+            aggregated = crud.get_aggregated_review_data(
+                db=db,
+                session_ids=request.session_ids,
+                limit=request.limit,
+                days=request.days
+            )
+            if aggregated.get("total_groups", 0) > 0:
+                logger.info(f"Aggregated per-session data available: {aggregated['total_groups']} groups")
+                # Persist as integrated cache for progress tracking
+                # Skip persistence when batch is active — the aggregated view is incomplete
+                if not generation_in_progress:
                     try:
                         crud.create_or_update_integrated_review_data(
                             db=db,
                             time_range_days=request.days,
-                            review_groups=aggregated_data.get("review_groups", []),
-                            aggregated_summary=aggregated_data.get("aggregated_summary", ""),
+                            review_groups=aggregated.get("review_groups", []),
+                            aggregated_summary=aggregated.get("aggregated_summary", ""),
                             next_review_date=(
-                                datetime.fromisoformat(aggregated_data["next_review_date"].replace('Z', '+00:00'))
-                                if aggregated_data.get("next_review_date") else datetime.utcnow() + timedelta(hours=24)
+                                datetime.fromisoformat(aggregated["next_review_date"].replace('Z', '+00:00'))
+                                if aggregated.get("next_review_date") else now + timedelta(hours=24)
                             ),
                             generation_config={
                                 "source": "aggregation",
-                                "session_count": aggregated_data.get("session_count", 0),
-                                "aggregated_at": datetime.utcnow().isoformat()
+                                "session_count": aggregated.get("session_count", 0),
+                                "aggregated_at": now.isoformat(),
+                                "session_groups": aggregated.get("session_groups", [])
                             },
-                            expires_at=datetime.utcnow() + timedelta(hours=24),
+                            expires_at=now + timedelta(hours=24),
                             generation_status="completed"
                         )
                     except Exception as e:
-                        logger.warning(f"Failed to create integrated review record: {e}")
+                        logger.warning(f"Failed to persist aggregated review: {e}")
+                display_data = aggregated
+                _enrich_session_titles_with_kg(display_data.get("session_groups"))
 
-                    return aggregated_data
+        # Nothing to display — return empty, but include progress info
+        if display_data is None:
+            logger.info(f"No review data available for {request.days}d, returning empty")
+            display_data = empty_integrated_review(request.days)
 
-            # No review data found or force refresh - check for sessions to generate
-            logger.info("No existing review data found or force refresh, checking for sessions to generate")
+        # ── 4. Trigger background generation if needed (fire-and-forget)
+        # Skip if a batch is already running for this time range
+        if not generation_in_progress:
             recent_sessions = crud.get_session_ids_with_recent_activity(db, days=3)
-
-            if not recent_sessions:
-                logger.info("No recent sessions found")
-                return empty_integrated_review(request.days)
-
-            # Check for already active generation tasks to avoid duplicate triggers
-            active_tasks_exist = db.query(crud.ReviewGenerationTask).filter(
-                crud.ReviewGenerationTask.session_id.in_(recent_sessions[:request.limit]),
-                crud.ReviewGenerationTask.status.in_(["pending", "running"])
-            ).first() is not None
-
-            if active_tasks_exist:
-                logger.info("Active generation tasks already exist, returning 202 without triggering new ones")
-                return JSONResponse(
-                    status_code=202,
-                    content={
-                        "message": "复习内容正在生成中，请稍候...",
-                        "status": "generating",
-                        "estimated_time": 120,
-                        "poll_url": f"/api/review/integrated/status?days={request.days}"
-                    }
-                )
-
-            # Trigger background generation only for sessions without valid review data
-            triggered_count = 0
-            for session_id in recent_sessions[:request.limit]:
-                try:
-                    # Skip sessions that already have valid (completed, not expired) review data
-                    # UNLESS there are new messages after the review was generated
+            if recent_sessions:
+                # Check if there's new content that needs generation
+                sessions_to_generate = []
+                for sid in recent_sessions[:request.limit]:
                     existing_review = db.query(ReviewData).filter(
-                        ReviewData.session_id == session_id,
+                        ReviewData.session_id == sid,
                         ReviewData.generation_status == "completed",
-                        ReviewData.expires_at > datetime.utcnow()
+                        ReviewData.expires_at > now
                     ).first()
-                    if existing_review:
-                        # Session has existing valid review — check if it's time to refresh
-                        last_message = crud.get_last_message(db, session_id)
-                        if (last_message and existing_review.generated_at
-                                and last_message.timestamp > existing_review.generated_at):
-                            # Session has new messages — only regenerate if review is old enough
-                            review_age_days = (datetime.utcnow() - existing_review.generated_at).days
-                            if review_age_days >= 7:
-                                logger.debug(f"Session {session_id} has new messages, review is {review_age_days} days old, regenerating")
-                            else:
-                                logger.debug(f"Session {session_id} has new messages but review is only {review_age_days} days old, keeping existing")
-                                continue
-                        else:
-                            logger.debug(f"Session {session_id} already has valid review, skipping")
-                            continue
+                    if not existing_review:
+                        # No valid review → needs generation
+                        sessions_to_generate.append(sid)
+                    else:
+                        # Has valid review → check for new messages
+                        last_msg = crud.get_last_message(db, sid)
+                        if (last_msg and existing_review.generated_at
+                                and last_msg.timestamp > existing_review.generated_at
+                                and (now - existing_review.generated_at).days >= 7):
+                            sessions_to_generate.append(sid)
 
-                    schedule_review_generation(
-                        session_id=session_id,
-                        config={
-                            "api_key": request.api_key,
-                            "base_url": request.base_url,
-                            "model": request.model,
-                            "priority": 5
-                        }
-                    )
-                    triggered_count += 1
-                except Exception as e:
-                    logger.error(f"Failed to schedule review generation for session {session_id}: {e}")
+                # Also trigger if force_refresh requested
+                if request.force_refresh:
+                    sessions_to_generate = recent_sessions[:request.limit]
 
-            logger.info(f"Triggered background review generation for {triggered_count} sessions")
+                if sessions_to_generate:
+                    try:
+                        schedule_batch_review_generation(
+                            session_ids=sessions_to_generate,
+                            config={
+                                "api_key": request.api_key,
+                                "base_url": request.base_url,
+                                "model": request.model,
+                            },
+                            batch_key=batch_key
+                        )
+                        generation_in_progress = True
+                        logger.info(f"Triggered batch review generation for {len(sessions_to_generate)} sessions")
+                    except Exception as e:
+                        logger.error(f"Failed to schedule batch review: {e}")
 
-            # Invalidate existing integrated cache so polling gets fresh aggregated data
-            if triggered_count > 0:
-                try:
-                    existing_integrated = db.query(ReviewData).filter(
-                        ReviewData.generation_type == "integrated",
-                        ReviewData.time_range_days == request.days
-                    ).first()
-                    if existing_integrated:
-                        db.delete(existing_integrated)
-                        db.commit()
-                        logger.info(f"Invalidated integrated cache for {request.days} days")
-                except Exception as e:
-                    logger.warning(f"Failed to invalidate integrated cache: {e}")
-                    db.rollback()
-
-            return JSONResponse(
-                status_code=202,
-                content={
-                    "message": f"正在为{triggered_count}个近期会话生成复习内容",
-                    "sessions_triggered": triggered_count,
-                    "status": "generating",
-                    "estimated_time": 120,
-                    "poll_url": f"/api/review/integrated/status?days={request.days}"
-                }
-            )
-
+                    # Invalidate integrated cache so next aggregation picks up fresh data
+                    if cached_integrated:
+                        try:
+                            cached_integrated.review_groups = []
+                            db.commit()
+                            logger.info(f"Invalidated integrated cache for {request.days}d (background regeneration)")
+                        except Exception as e:
+                            logger.warning(f"Failed to invalidate cache: {e}")
+                            db.rollback()
         else:
-            # 7-30 days: use node-based analysis
-            logger.info(f"Generating node-based integrated review for {request.days} days")
+            batch_progress = get_batch_progress(batch_key)
+            logger.info(f"Batch '{batch_key}' already active ({batch_progress.get('completed', 0)}/{batch_progress.get('total', 0)}), skipping trigger")
 
-            # Trigger background generation and return 202 Accepted
+        # Also handle 7-30 day range: trigger node-based generation
+        if request.days > 7:
             try:
                 config = {
                     "api_key": request.api_key,
@@ -744,28 +853,16 @@ async def get_integrated_review_overview(
                     "model": request.model,
                     "priority": 10
                 }
-
-                task_id = schedule_integrated_review_generation(
-                    days=request.days,
-                    config=config
-                )
-
-                logger.info(f"Background integrated review task {task_id} scheduled for {request.days} days")
+                schedule_integrated_review_generation(days=request.days, config=config)
+                logger.info(f"Triggered background node-based review for {request.days}d")
             except Exception as e:
-                logger.error(f"Failed to trigger background generation: {e}")
-                # Fall through to synchronous generation as fallback
+                logger.error(f"Failed to trigger 7-30d generation: {e}")
 
-            # Return 202 Accepted with task info
-            return JSONResponse(
-                status_code=202,
-                content={
-                    "message": f"集成复习生成已开始（{request.days}天范围）",
-                    "days": request.days,
-                    "status": "generating",
-                    "estimated_time": 120,
-                    "poll_url": f"/api/review/integrated/status?days={request.days}"
-                }
-            )
+        # ── 5. Always return data ──────────────────────────────────────
+        display_data["generation_in_progress"] = generation_in_progress
+        if generation_in_progress:
+            display_data["batch_progress"] = get_batch_progress(batch_key)
+        return display_data
 
     except Exception as e:
         logger.error(f"Error generating integrated review: {e}")

@@ -43,8 +43,14 @@ class GraphGenerator:
         }
         return color_map.get(group, "#B8B8B8")
 
-    def generate_session_graph(self, session_id: str) -> Dict[str, Any]:
-        """Generate graph data for a specific session from Neo4j"""
+    def generate_session_graph(self, session_id: str, min_importance: float = 2.0) -> Dict[str, Any]:
+        """Generate graph data for a specific session from Neo4j.
+
+        Args:
+            session_id: The session to generate graph for.
+            min_importance: Minimum importance_score to include an entity (default 2.0).
+                            Set to 0 to show all entities.
+        """
         logger.debug(f"Generating graph for session: {session_id}")
 
         driver = get_driver()
@@ -62,30 +68,47 @@ class GraphGenerator:
                 entities_result = session.run("""
                     MATCH (e:Entity)
                     WHERE $session_id IN e.session_ids
-                    RETURN e.name as name, e.type as type, e.description as description, e.mention_count as mention_count, e.importance_score as importance
+                    RETURN e.name as name, e.type as type, e.description as description,
+                           e.mention_count as mention_count, e.importance_score as importance_score,
+                           e.session_ids as session_ids, e.importance_scores as importance_scores
                 """, session_id=session_id)
 
                 entities = []
                 entity_map = {}  # name -> id mapping
+                next_id = 1
 
-                for idx, record in enumerate(entities_result):
+                for record in entities_result:
                     name = record["name"]
                     entity_type = record["type"]
                     description = record["description"]
                     mention_count = record["mention_count"] or 1
-                    importance = record["importance"] or 1.0
+                    importance_score = record["importance_score"] or 1.0
+                    session_ids = record["session_ids"] or []
+                    importance_scores = record["importance_scores"] or []
 
-                    entity_map[name] = idx + 1
+                    # Get session-specific importance score for filtering
+                    session_importance = importance_score  # fallback to aggregate
+                    if session_id in session_ids and importance_scores:
+                        sidx = session_ids.index(session_id)
+                        if sidx < len(importance_scores):
+                            session_importance = importance_scores[sidx]
+
+                    # Filter out low-importance entities for a cleaner graph
+                    if min_importance > 0 and session_importance < min_importance:
+                        continue
+
+                    entity_map[name] = next_id
+                    next_id += 1
 
                     entities.append({
-                        "id": idx + 1,
+                        "id": next_id - 1,
                         "label": name,
                         "group": self._map_entity_type(entity_type),
                         "title": description or name,
                         "color": self._get_group_color(entity_type),
-                        "value": mention_count * importance,  # for node size in vis-network
+                        "value": mention_count * importance_score,  # for node size in vis-network
                         "mention_count": mention_count,  # custom property for frontend
-                        "importance": importance,  # importance score (1-5)
+                        "importance": importance_score,  # aggregate importance score (1-5)
                     })
 
                 # Get relationships for these entities (relationships created in this session)
@@ -184,8 +207,13 @@ class GraphGenerator:
             logger.error(f"Error getting entities for sessions: {e}")
             return []
 
-    def generate_global_graph(self, limit: int = 100) -> Dict[str, Any]:
-        """Generate graph data for all sessions from Neo4j"""
+    def generate_global_graph(self, limit: int = 100, min_importance: float = 2.0) -> Dict[str, Any]:
+        """Generate graph data for all sessions from Neo4j.
+
+        Args:
+            limit: Maximum number of entities to return.
+            min_importance: Minimum importance_score to include an entity (default 2.0).
+        """
         logger.debug(f"Generating global graph with limit: {limit}")
 
         driver = get_driver()
@@ -201,27 +229,31 @@ class GraphGenerator:
 
         try:
             with driver.session() as session:
-                # Get all entities (limited)
+                # Get all entities (limited, filtered by importance)
                 entities_result = session.run("""
                     MATCH (e:Entity)
+                    WHERE e.importance_score >= $min_importance
                     RETURN e.name as name, e.type as type, e.description as description, e.mention_count as mention_count, e.importance_score as importance
+                    ORDER BY e.mention_count DESC, e.importance_score DESC
                     LIMIT $limit
-                """, limit=limit)
+                """, limit=limit, min_importance=min_importance)
 
                 entities = []
                 entity_map = {}
+                next_id = 1
 
-                for idx, record in enumerate(entities_result):
+                for record in entities_result:
                     name = record["name"]
                     entity_type = record["type"]
                     description = record["description"]
                     mention_count = record["mention_count"] or 1
                     importance = record["importance"] or 1.0
 
-                    entity_map[name] = idx + 1
+                    entity_map[name] = next_id
+                    next_id += 1
 
                     entities.append({
-                        "id": idx + 1,
+                        "id": next_id - 1,
                         "label": name,
                         "group": self._map_entity_type(entity_type),
                         "title": description or name,

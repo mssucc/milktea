@@ -1,4 +1,5 @@
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import desc, and_
 from sqlalchemy.exc import OperationalError
 from datetime import datetime, timedelta
@@ -601,6 +602,122 @@ def delete_review_data(db: Session, session_id: str) -> bool:
                 raise
     return False
 
+def delete_review_group(db: Session, session_id: str, group_id: str) -> bool:
+    """Delete a specific review group from a session's review data."""
+    review_data = get_review_data(db, session_id)
+    if not review_data or not review_data.review_groups:
+        return False
+
+    groups = review_data.review_groups or []
+    original_len = len(groups)
+    filtered = [g for g in groups if g.get("id") != group_id]
+
+    if len(filtered) == original_len:
+        return False  # group not found
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            review_data.review_groups = filtered
+            review_data.last_attempt_at = datetime.utcnow()
+            db.commit()
+            db.refresh(review_data)
+            return True
+        except OperationalError as e:
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 0.1
+                time.sleep(wait_time)
+                db.rollback()
+                continue
+            else:
+                raise
+        except Exception:
+            db.rollback()
+            raise
+    return False
+
+
+def remove_session_from_integrated_caches(db: Session, session_id: str) -> bool:
+    """Remove a session's groups from all integrated ReviewData caches."""
+    integrated_records = db.query(ReviewData).filter(
+        ReviewData.generation_type == "integrated"
+    ).all()
+
+    cleaned = False
+    for record in integrated_records:
+        config = dict(record.generation_config or {})
+        session_groups = config.get("session_groups", [])
+        original_len = len(session_groups)
+        filtered = [sg for sg in session_groups if sg.get("session_id") != session_id]
+        if len(filtered) < original_len:
+            config["session_groups"] = filtered
+            record.generation_config = config
+            flag_modified(record, "generation_config")
+            cleaned = True
+
+    if cleaned:
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                db.commit()
+                return True
+            except OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    time.sleep((attempt + 1) * 0.1)
+                    db.rollback()
+                    continue
+                else:
+                    raise
+            except Exception:
+                db.rollback()
+                raise
+    return cleaned
+
+
+def remove_group_from_integrated_caches(db: Session, session_id: str, group_id: str) -> bool:
+    """Remove a specific group from all integrated ReviewData caches matching the session_id."""
+    integrated_records = db.query(ReviewData).filter(
+        ReviewData.generation_type == "integrated"
+    ).all()
+
+    cleaned = False
+    for record in integrated_records:
+        config = dict(record.generation_config or {})
+        session_groups = config.get("session_groups", [])
+        for sg in session_groups:
+            if sg.get("session_id") == session_id:
+                groups = sg.get("groups", [])
+                original_len = len(groups)
+                sg["groups"] = [g for g in groups if g.get("id") != group_id]
+                if len(sg["groups"]) < original_len:
+                    sg["group_count"] = len(sg["groups"])
+                    if sg["group_count"] == 0:
+                        session_groups.remove(sg)
+                    config["session_groups"] = session_groups
+                    record.generation_config = config
+                    flag_modified(record, "generation_config")
+                    cleaned = True
+                break
+
+    if cleaned:
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                db.commit()
+                return True
+            except OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    time.sleep((attempt + 1) * 0.1)
+                    db.rollback()
+                    continue
+                else:
+                    raise
+            except Exception:
+                db.rollback()
+                raise
+    return cleaned
+
+
 def get_sessions_needing_review_generation(
     db: Session,
     session_ids: List[str],
@@ -773,6 +890,9 @@ def get_aggregated_review_data(db: Session, session_ids: Optional[List[str]] = N
     Returns:
         Dictionary with aggregated review data in new structured format
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     # Get review data for specified sessions or recent valid reviews
     if session_ids:
         review_data_list = (
@@ -793,6 +913,7 @@ def get_aggregated_review_data(db: Session, session_ids: Optional[List[str]] = N
         return {
             "aggregated_summary": "近期会话中没有复习数据。",
             "review_groups": [],
+            "session_groups": [],
             "next_review_date": datetime.utcnow().isoformat(),
             "session_count": 0,
             "total_groups": 0,
@@ -828,6 +949,11 @@ def get_aggregated_review_data(db: Session, session_ids: Optional[List[str]] = N
             return 0.1
 
     for review_data in review_data_list:
+        # Skip records with missing session_id (defensive)
+        if not review_data.session_id:
+            logger.warning(f"Skipping review_data record with NULL session_id (review id={review_data.id})")
+            continue
+
         # Calculate recency weight using two-stage decay
         days_old = (now - review_data.generated_at).days if review_data.generated_at else 30
         recency_weight = calculate_two_stage_weight(days_old)
@@ -849,13 +975,16 @@ def get_aggregated_review_data(db: Session, session_ids: Optional[List[str]] = N
             if not isinstance(group, dict):
                 continue
 
+            # Skip fallback placeholder groups (generated when LLM fails)
+            group_id = group.get("id", "")
+            if group_id in ("general_knowledge", "node_based_general"):
+                continue
+
             # Use title as primary key for grouping (new structured format)
             title = group.get("title", "")
             if not title:
                 # Fallback to id if title is missing
                 title = group.get("id", "未命名分组")
-
-            group_id = group.get("id", title.lower().replace(" ", "_"))
             description = group.get("description", f"关于{title}的复习内容")
 
             # Initialize group if not exists
@@ -970,6 +1099,94 @@ def get_aggregated_review_data(db: Session, session_ids: Optional[List[str]] = N
                             "is_completed": False,
                             "source_sessions": [review_data.session_id]
                         })
+
+    # Build session_groups for nested accordion display
+    # Each session keeps its original groups (not merged across sessions)
+    session_ids_in_review = [rd.session_id for rd in review_data_list if rd.session_id]
+    session_records = db.query(ChatSession).filter(ChatSession.id.in_(session_ids_in_review)).all()
+    session_title_map = {s.id: s.title for s in session_records if s.title}
+
+    session_groups = []
+    for review_data in review_data_list:
+        if not review_data.session_id or not review_data.review_groups:
+            continue
+
+        groups_for_session = []
+        for group in review_data.review_groups:
+            if not isinstance(group, dict):
+                continue
+            group_id = group.get("id", "")
+            if group_id in ("general_knowledge", "node_based_general"):
+                continue
+
+            # Format knowledge cards (same structure as merged groups)
+            formatted_cards = []
+            for card in (group.get("knowledge_cards") or []):
+                if not isinstance(card, dict):
+                    continue
+                content = (card.get("content") or "").strip()
+                if len(content) < 5:
+                    continue
+                formatted_cards.append({
+                    "id": card.get("id", ""),
+                    "content": content,
+                    "is_learned": False
+                })
+
+            # Format quiz questions (same structure as merged groups)
+            formatted_questions = []
+            for q in (group.get("quiz_questions") or []):
+                if not isinstance(q, dict):
+                    continue
+                question_text = (q.get("question") or "").strip()
+                if len(question_text) < 5:
+                    continue
+                options = q.get("options", [])
+                if not isinstance(options, list) or len(options) < 4:
+                    options = ["选项A", "选项B", "选项C", "选项D"]
+                correct_answer = q.get("correct_answer", 0)
+                if not isinstance(correct_answer, int) or correct_answer < 0 or correct_answer >= len(options):
+                    correct_answer = 0
+                explanation = (q.get("explanation") or "").strip()
+                if not explanation:
+                    explanation = f"正确答案是选项{['A','B','C','D'][correct_answer]}"
+                difficulty = q.get("difficulty", "medium")
+                if difficulty not in ("easy", "medium", "hard"):
+                    difficulty = "medium"
+                formatted_questions.append({
+                    "id": q.get("id", ""),
+                    "question": question_text,
+                    "options": options,
+                    "correct_answer": correct_answer,
+                    "explanation": explanation,
+                    "difficulty": difficulty,
+                    "is_completed": False
+                })
+
+            title = group.get("title") or group.get("id", "未命名分组")
+            description = group.get("description") or f"关于{title}的复习内容"
+
+            is_note_group = review_data.session_id.startswith("note:")
+            groups_for_session.append({
+                "id": group_id,
+                "title": title,
+                "description": description,
+                "knowledge_cards": formatted_cards,
+                "quiz_questions": formatted_questions,
+                "frequency": 0 if is_note_group else 1,
+                "session_count": 0 if is_note_group else 1
+            })
+
+        if groups_for_session:
+            is_note = review_data.session_id.startswith("note:")
+            note_title = review_data.session_id[5:] if is_note else ""
+            session_groups.append({
+                "session_id": review_data.session_id,
+                "title": note_title or session_title_map.get(review_data.session_id) or (review_data.session_id[:8] + "..."),
+                "generated_at": review_data.generated_at.isoformat() if review_data.generated_at else None,
+                "groups": groups_for_session,
+                "group_count": len(groups_for_session)
+            })
 
     # Calculate final weights for each group (knowledge depth priority)
     # Weight = frequency * avg_recency_weight * (1 + log(frequency))
@@ -1090,6 +1307,7 @@ def get_aggregated_review_data(db: Session, session_ids: Optional[List[str]] = N
     return {
         "aggregated_summary": aggregated_summary,
         "review_groups": selected_groups,
+        "session_groups": session_groups,
         "next_review_date": next_review_date.isoformat(),
         "session_count": len(session_info),
         "total_groups": len(selected_groups),

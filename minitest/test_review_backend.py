@@ -5,10 +5,11 @@ import sys
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import asyncio
 
-# Add the project root to the path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add the agent directory to the path
+sys.path.insert(0, str(Path(__file__).parent.parent / "agent"))
 
 from sqlalchemy.orm import Session
 from backend.database.session import SessionLocal, init_db

@@ -127,6 +127,20 @@
       </div>
     </div>
   </div>
+
+  <!-- Confirm Delete Dialog -->
+  <div v-if="confirmDialog.show" class="confirm-overlay" @click.self="closeConfirm">
+    <div class="confirm-dialog">
+      <div class="confirm-dialog-header">
+        <h4>{{ confirmDialog.title }}</h4>
+      </div>
+      <p class="confirm-message">{{ confirmDialog.message }}</p>
+      <div class="confirm-dialog-footer">
+        <button @click="closeConfirm" class="confirm-btn cancel">取消</button>
+        <button @click="executeConfirm" class="confirm-btn danger">确认删除</button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -272,16 +286,37 @@ const handleSessionClick = async (sessionId: string) => {
   }
 }
 
-const deleteSession = async (sessionId: string) => {
-  if (!confirm('Delete this session and all its messages?')) return
+// Confirm dialog state
+const confirmDialog = ref<{
+  show: boolean
+  title: string
+  message: string
+  onConfirm: () => void
+}>({ show: false, title: '', message: '', onConfirm: () => {} })
 
-  try {
-    await chatStore.deleteSession(sessionId)
-    // Refresh sessions list
-    await chatStore.fetchSessions()
-  } catch (err) {
-    console.error('Error deleting session:', err)
-  }
+const showConfirm = (title: string, message: string, onConfirm: () => void) => {
+  confirmDialog.value = { show: true, title, message, onConfirm }
+}
+
+const closeConfirm = () => {
+  confirmDialog.value = { show: false, title: '', message: '', onConfirm: () => {} }
+}
+
+const executeConfirm = () => {
+  const cb = confirmDialog.value.onConfirm
+  closeConfirm()
+  cb()
+}
+
+const deleteSession = (sessionId: string) => {
+  showConfirm('删除会话', '将删除该会话及其全部消息记录，此操作不可撤销。', async () => {
+    try {
+      await chatStore.deleteSession(sessionId)
+      await chatStore.fetchSessions()
+    } catch (err) {
+      console.error('Error deleting session:', err)
+    }
+  })
 }
 
 const refreshSessions = async () => {
@@ -999,5 +1034,80 @@ onUnmounted(() => {
     flex-direction: column;
     gap: 5px;
   }
+}
+
+/* Confirm dialog shared styles (also used by ReviewPanel) */
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(74, 74, 109, 0.2);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.confirm-dialog {
+  background: #fff;
+  border-radius: 16px;
+  padding: 28px;
+  width: 380px;
+  max-width: 90vw;
+  box-shadow: 0 16px 48px rgba(156, 137, 184, 0.2);
+  color: #4a4a6d;
+}
+
+.confirm-dialog-header {
+  margin-bottom: 12px;
+}
+
+.confirm-dialog-header h4 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: #4a4a6d;
+}
+
+.confirm-message {
+  margin: 0 0 24px 0;
+  font-size: 14px;
+  color: #6a6a80;
+  line-height: 1.6;
+}
+
+.confirm-dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.confirm-btn {
+  padding: 8px 20px;
+  border-radius: 10px;
+  border: none;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.confirm-btn.cancel {
+  background: #f5f0fa;
+  color: #8e8ea0;
+}
+
+.confirm-btn.cancel:hover {
+  background: #ebe4f5;
+  color: #4a4a6d;
+}
+
+.confirm-btn.danger {
+  background: linear-gradient(135deg, #e06060, #d04848);
+  color: #fff;
+}
+
+.confirm-btn.danger:hover {
+  background: linear-gradient(135deg, #c85050, #b84040);
 }
 </style>
